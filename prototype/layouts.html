@@ -1,0 +1,776 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard Layout Prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+<style>
+/* Rose Pine Dawn (light) and Rose Pine (dark), as in the herdr config. */
+:root {
+  --base: #faf4ed; --surface: #fffaf3; --overlay: #f2e9e1; --muted: #9893a5;
+  --subtle: #797593; --text: #575279; --love: #b4637a; --gold: #ea9d34;
+  --rose: #d7827e; --pine: #286983; --foam: #56949f; --iris: #907aa9;
+  --hl-low: #f4ede8; --hl-med: #dfdad9; --hl-high: #cecacd;
+  --page: #f2e9e1; --shadow: rgba(87, 82, 121, .18);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --base: #191724; --surface: #1f1d2e; --overlay: #26233a; --muted: #6e6a86;
+    --subtle: #908caa; --text: #e0def4; --love: #eb6f92; --gold: #f6c177;
+    --rose: #ebbcba; --pine: #31748f; --foam: #9ccfd8; --iris: #c4a7e7;
+    --hl-low: #21202e; --hl-med: #403d52; --hl-high: #524f67;
+    --page: #13111c; --shadow: rgba(0, 0, 0, .5);
+  }
+}
+:root[data-theme="dark"] {
+  --base: #191724; --surface: #1f1d2e; --overlay: #26233a; --muted: #6e6a86;
+  --subtle: #908caa; --text: #e0def4; --love: #eb6f92; --gold: #f6c177;
+  --rose: #ebbcba; --pine: #31748f; --foam: #9ccfd8; --iris: #c4a7e7;
+  --hl-low: #21202e; --hl-med: #403d52; --hl-high: #524f67;
+  --page: #13111c; --shadow: rgba(0, 0, 0, .5);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--text);
+  font: 14px/1.5 Inter, system-ui, sans-serif;
+}
+header { padding: 20px 24px 8px; }
+header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+header p { margin: 4px 0 0; color: var(--subtle); max-width: 70ch; }
+.wrap { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 20px; padding: 16px 24px 40px; }
+@media (max-width: 900px) { .wrap { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 32px; } header { padding: 16px 16px 4px; } }
+
+.card { background: var(--surface); border: 1px solid var(--hl-med); border-radius: 10px; padding: 14px 16px; }
+.card + .card { margin-top: 14px; }
+.card h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--subtle); font-weight: 600; }
+
+.layouts { display: grid; gap: 6px; }
+.layouts button {
+  text-align: left; border: 1px solid var(--hl-med); background: var(--base); color: var(--text);
+  border-radius: 8px; padding: 8px 10px; cursor: pointer; font: inherit;
+}
+.layouts button b { display: block; font-weight: 600; }
+.layouts button span { color: var(--subtle); font-size: 12.5px; }
+.layouts button[aria-pressed="true"] { border-color: var(--iris); box-shadow: inset 3px 0 0 var(--iris); }
+
+.seg { display: flex; flex-wrap: wrap; gap: 4px; }
+.seg button {
+  border: 1px solid var(--hl-med); background: var(--base); color: var(--text); border-radius: 6px;
+  padding: 4px 9px; cursor: pointer; font: 12.5px/1.4 Inter, system-ui, sans-serif;
+}
+.seg button[aria-pressed="true"] { background: var(--iris); border-color: var(--iris); color: var(--base); }
+.ctxnote { color: var(--subtle); font-size: 12.5px; margin: 8px 0 0; }
+
+.keys { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 12.5px; }
+.keys kbd { font: 12px JetBrains Mono, ui-monospace, monospace; background: var(--overlay); border-radius: 4px; padding: 0 5px; justify-self: start; }
+
+.stage { overflow-x: auto; border-radius: 10px; }
+.term {
+  --fs: 13px; --lh: calc(var(--fs) * 1.32);
+  position: relative; display: inline-block; background: var(--base); border-radius: 10px;
+  border: 1px solid var(--hl-med); font: var(--fs)/var(--lh) "JetBrains Mono", ui-monospace, monospace;
+  white-space: pre; outline: none;
+}
+.term:focus-visible { box-shadow: 0 0 0 2px var(--iris); }
+.bg { color: var(--muted); opacity: .45; padding: 0; }
+.popup {
+  position: absolute; left: 8ch; top: calc(var(--lh) * 3);
+  background: var(--base); box-shadow: 0 10px 40px var(--shadow);
+}
+.ln { height: var(--lh); }
+.focus-hint { font-size: 12.5px; color: var(--subtle); margin: 6px 2px 0; }
+
+.below { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin-top: 14px; }
+@media (max-width: 1100px) { .below { grid-template-columns: minmax(0, 1fr); } }
+.below .card + .card { margin-top: 0; }
+.notes p { margin: 0 0 6px; }
+.notes ul { margin: 4px 0 0; padding-left: 18px; }
+.notes li { margin: 2px 0; }
+.log { font: 12px/1.5 JetBrains Mono, ui-monospace, monospace; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+.log div { padding: 2px 0; border-bottom: 1px dashed var(--hl-med); }
+.log .muted { color: var(--muted); }
+
+/* Terminal cell classes. */
+.bd { color: var(--hl-high); }
+.bd-focus { color: var(--iris); }
+.title { color: var(--subtle); }
+.title-focus { color: var(--text); font-weight: 700; }
+.muted { color: var(--muted); }
+.subtle { color: var(--subtle); }
+.b { font-weight: 700; }
+.mx-zellij { color: var(--foam); font-weight: 700; }
+.mx-herdr { color: var(--iris); font-weight: 700; }
+.mx-tmux { color: var(--rose); font-weight: 700; }
+.agent { color: var(--gold); }
+.cur { color: var(--love); }
+.st-working { color: var(--gold); }
+.st-idle { color: var(--foam); }
+.st-blocked { color: var(--love); font-weight: 700; }
+.st-done { color: var(--pine); }
+.exited { color: var(--muted); font-style: italic; }
+.sel { background: var(--hl-med); }
+.sel-dim { background: var(--hl-low); }
+.tab-on { background: var(--iris); color: var(--base); font-weight: 700; }
+.tab-off { color: var(--subtle); }
+.hint-k { color: var(--iris); font-weight: 700; }
+.prompt { color: var(--gold); font-weight: 700; }
+.caret { background: var(--text); color: var(--base); }
+.toast { color: var(--pine); }
+.warn { color: var(--love); }
+.ps-dir { color: var(--pine); }
+.ps-git { color: var(--iris); }
+.hdr { color: var(--subtle); text-decoration: underline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>multiplexer-dashboard: layout prototype</h1>
+  <p>Four candidate layouts for the session and agent popup, all rendered from the same mock data. Click the terminal, then use the keys listed on the left. Each action prints the command the real app would run under the terminal.</p>
+</header>
+
+<div class="wrap">
+  <aside>
+    <div class="card">
+      <h2>Layout</h2>
+      <div class="layouts" id="layouts"></div>
+    </div>
+    <div class="card">
+      <h2>Where the popup runs</h2>
+      <div class="seg" id="ctx"></div>
+      <p class="ctxnote" id="ctxnote"></p>
+    </div>
+    <div class="card">
+      <h2>Popup size</h2>
+      <div class="seg" id="size"></div>
+    </div>
+    <div class="card">
+      <h2>Theme</h2>
+      <div class="seg" id="theme"></div>
+    </div>
+    <div class="card">
+      <h2>Keys</h2>
+      <div class="keys">
+        <kbd>j k ↑ ↓</kbd><span>move</span>
+        <kbd>g G</kbd><span>first / last</span>
+        <kbd>Tab</kbd><span>sessions ⇄ agents (A, C, D)</span>
+        <kbd>h l ← →</kbd><span>fold / unfold session (B)</span>
+        <kbd>Enter</kbd><span>switch to session / jump to agent</span>
+        <kbd>/</kbd><span>filter as you type, Esc clears</span>
+        <kbd>n</kbd><span>new session</span>
+        <kbd>r</kbd><span>rename session</span>
+        <kbd>x</kbd><span>kill session (y to confirm)</span>
+        <kbd>q Esc</kbd><span>close the popup</span>
+      </div>
+    </div>
+  </aside>
+
+  <main>
+    <div class="stage"><div class="term" id="term" tabindex="0"><div class="bg" id="bg"></div><div class="popup" id="popup"></div></div></div>
+    <p class="focus-hint" id="focushint">Click the terminal to send keys to the popup.</p>
+    <div class="below">
+      <div class="card notes" id="notes"></div>
+      <div class="card"><h2>Commands the app would run</h2><div class="log" id="log"><div class="muted">Nothing yet. Press Enter, n, r or x in the popup.</div></div></div>
+    </div>
+  </main>
+</div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- mock data
+// Session order inside a group follows each multiplexer's own listing order.
+const DATA = {
+  zellij: [
+    { name: "dotfiles", tabs: ["dotfiles", "dotfiles/config"], cwd: "~/Desktop/dotfiles", age: "3h" },
+    { name: "duanyan-tui", tabs: ["duanyan-tui", "duanyan-tui/crates"], cwd: "~/Desktop/personal-projects/duanyan-tui", age: "1d" },
+    { name: "pi-mono", tabs: ["pi-mono"], cwd: "~/Desktop/personal-projects/pi-mono", age: "20m" },
+    { name: "old-notes", tabs: [], cwd: "~/notes", age: "6d", exited: true },
+  ],
+  herdr: [
+    { name: "agent-scratch", id: "w4R", tabs: ["1"], cwd: "~/Desktop/personal-projects/agent-scratch", age: "" },
+    { name: "multiplexer-dashboard", id: "w53", tabs: ["1", "2"], cwd: "~/Desktop/personal-projects/multiplexer-dashboard", age: "" },
+    { name: "herdr", id: "w60", tabs: ["1"], cwd: "~/Desktop/personal-projects/herdr", age: "" },
+  ],
+  tmux: [
+    { name: "~", tabs: ["zsh", "btop"], cwd: "~", age: "2d", attached: true },
+    { name: "scratch", tabs: ["zsh"], cwd: "~", age: "5h" },
+    { name: "monopi", tabs: ["nvim", "pi", "zsh"], cwd: "~/Desktop/personal-projects/monopi", age: "40m" },
+  ],
+};
+// status exists only for herdr, which detects agent state itself.
+const AGENTS = [
+  { mux: "zellij", session: "dotfiles", tab: "dotfiles", pane: "terminal_2", agent: "claude" },
+  { mux: "zellij", session: "duanyan-tui", tab: "duanyan-tui", pane: "terminal_1", agent: "claude" },
+  { mux: "zellij", session: "duanyan-tui", tab: "duanyan-tui/crates", pane: "terminal_5", agent: "codex" },
+  { mux: "herdr", session: "multiplexer-dashboard", tab: "1", pane: "w53:pB", agent: "claude", status: "working" },
+  { mux: "herdr", session: "herdr", tab: "1", pane: "w60:p2", agent: "opencode", status: "idle" },
+  { mux: "herdr", session: "agent-scratch", tab: "1", pane: "w4R:p1", agent: "pi", status: "blocked" },
+  { mux: "tmux", session: "monopi", tab: "2:pi", pane: "%7", agent: "pi" },
+  { mux: "tmux", session: "~", tab: "1:zsh", pane: "%2", agent: "gemini" },
+];
+const STATUS_GLYPH = { working: "◐", idle: "○", blocked: "●", done: "✓" };
+
+const CONTEXTS = {
+  outside: { label: "Outside", groups: ["zellij", "herdr", "tmux"], inside: [], current: {},
+    note: "No multiplexer detected: every installed one is listed, zellij > herdr > tmux. Enter replaces the dashboard with an attaching client." },
+  tmux: { label: "In tmux", groups: ["tmux"], inside: ["tmux"], current: { tmux: "~" },
+    note: "Inside tmux (a floating pane from a prefix binding): only tmux sessions. Enter switches the calling client." },
+  zellij: { label: "In zellij", groups: ["zellij"], inside: ["zellij"], current: { zellij: "dotfiles" },
+    note: "Inside zellij (a floating pane from Run … floating true close_on_exit true): only zellij sessions, including exited ones that can be resurrected." },
+  herdr: { label: "In herdr", groups: ["herdr"], inside: ["herdr"], current: { herdr: "multiplexer-dashboard" },
+    note: "Inside herdr (a popup command): only workspaces of the default herdr server, with herdr's own agent status." },
+  nested: { label: "zellij in tmux", groups: ["zellij", "tmux"], inside: ["zellij", "tmux"], current: { zellij: "dotfiles", tmux: "~" },
+    note: "Nested: both TMUX and ZELLIJ are set, so both are listed in the usual order, and each switches its own client." },
+};
+const SIZES = { L: [112, 30], M: [90, 24], S: [62, 20] };
+const LAYOUTS = {
+  A: { name: "A · Sidebar + preview", desc: "herdr-like: sessions over agents, preview on the right",
+    notes: ["<b>Sidebar + preview.</b> Sessions sit above agents in a left column, the way herdr's sidebar does, and the right side shows the selected session's focused pane or the selected agent's pane. Tab moves between the two lists.",
+      ["Closest to herdr's sidebar, and the preview helps when names alone are ambiguous.",
+       "Each cursor move costs one capture call: tmux capture-pane, herdr pane read, or zellij dump-screen (to verify for other sessions).",
+       "Needs a wide popup. Below 70 columns the preview is hidden and the sidebar takes the full width."]] },
+  B: { name: "B · Unified tree", desc: "choose-tree-like: mux › session › agent, preview below",
+    notes: ["<b>Unified tree.</b> One cursor walks multiplexer › session › agent, with each agent nested under its session, the same way choose-tree nests windows. h/l folds a session. The preview sits below the tree when the popup is at least 22 rows tall.",
+      ["Shows where every agent lives without a second list. Enter on a session switches to it, Enter on an agent jumps to its pane.",
+       "With many sessions the agents get scattered and the list grows long, though filtering helps.",
+       "There is no flat list of every agent, the way herdr's agent section has one."]] },
+  C: { name: "C · Two columns", desc: "sessions | agents side by side, no preview",
+    notes: ["<b>Two columns.</b> Sessions and agents side by side at full height, with a one-line detail of the selection (directory, tabs, age) instead of a preview.",
+      ["Shows both lists at once and makes no capture calls, so it is the fastest to open and to move in.",
+       "Cramped under about 80 columns, where long session names get cut.",
+       "The detail line covers the common need for a preview: telling apart sessions in similar directories."]] },
+  D: { name: "D · Tabbed table", desc: "one list at a time, with columns",
+    notes: ["<b>Tabbed table.</b> One full-width list at a time, Sessions or Agents, with columns. Tab switches the list.",
+      ["Fits narrow popups best, and the columns show the most detail per row (multiplexer, tabs, agent count, directory).",
+       "Sessions and agents are never visible together.",
+       "Closest to zellij's session-manager, and the easiest to read when the list is long."]] },
+};
+
+// ---------------------------------------------------------------- state
+const state = {
+  layout: "A", ctx: "outside", size: "L",
+  focus: "sessions",                 // A, C, D: which list has the cursor
+  cur: { sessions: 0, agents: 0, tree: 0 },
+  folded: new Set(),                 // B: "mux/name" of folded sessions
+  filter: "",
+  mode: null,                        // null | filter | rename | kill | new
+  input: "", target: null,
+  toast: null, toastTimer: 0,
+  log: [],
+};
+
+// ---------------------------------------------------------------- cells
+const S = (t, c = "") => ({ t: String(t), c });
+const chars = s => [...s];
+const len = line => line.reduce((n, s) => n + chars(s.t).length, 0);
+function fit(line, w) {
+  const out = []; let n = 0;
+  for (const s of line) {
+    const cs = chars(s.t);
+    if (n + cs.length <= w) { out.push(s); n += cs.length; continue; }
+    const room = w - n;
+    if (room > 0) out.push(S(cs.slice(0, room - 1).join("") + "…", s.c));
+    n = w; break;
+  }
+  if (n < w) out.push(S(" ".repeat(w - n)));
+  return out;
+}
+// Left part truncated so that the right part always fits.
+const lr = (left, right, w) => fit([...fit(left, Math.max(0, w - len(right))), ...right], w);
+const paint = (line, cls) => line.map(s => S(s.t, (s.c + " " + cls).trim()));
+const pad = (s, w) => { const c = chars(s); return c.length >= w ? c.slice(0, Math.max(0, w - 1)).join("") + (w > 0 ? "…" : "") : s + " ".repeat(w - c.length); };
+
+function box(title, body, w, h, focused, right = null) {
+  const bc = focused ? "bd-focus" : "bd", inner = w - 2;
+  const top = [S("╭─", bc)];
+  if (title) top.push(...(Array.isArray(title) ? title : [S(" " + title + " ", focused ? "title-focus" : "title")]));
+  const rt = right ? [S(" " + right + " ", "muted"), S("─╮", bc)] : [S("╮", bc)];
+  const fill = w - len(top) - len(rt);
+  top.push(S("─".repeat(Math.max(0, fill)), bc), ...rt);
+  const lines = [fit(top, w)];
+  for (let i = 0; i < h - 2; i++) lines.push([S("│", bc), ...fit(body[i] || [], inner), S("│", bc)]);
+  lines.push([S("╰" + "─".repeat(inner) + "╯", bc)]);
+  return lines;
+}
+const hjoin = (...cols) => cols[0].map((_, i) => cols.flatMap(c => c[i]));
+
+// Keeps the cursor row visible: returns the slice of rows to draw.
+function scroll(rows, selRow, h) {
+  if (rows.length <= h) return rows;
+  let start = Math.max(0, Math.min(selRow - Math.floor(h / 2), rows.length - h));
+  return rows.slice(start, start + h);
+}
+
+// ---------------------------------------------------------------- model
+const ctx = () => CONTEXTS[state.ctx];
+const isInside = mux => ctx().inside.includes(mux);
+const isCurrent = (mux, name) => ctx().current[mux] === name;
+const q = () => state.filter.toLowerCase();
+const matchS = s => !q() || s.name.toLowerCase().includes(q());
+const matchA = a => !q() || [a.agent, a.session, a.tab].some(x => x.toLowerCase().includes(q()));
+const agentsOf = (mux, name) => AGENTS.filter(a => a.mux === mux && a.session === name);
+
+function sessionRows() {
+  const rows = [];
+  for (const mux of ctx().groups) {
+    const ss = DATA[mux].filter(matchS);
+    if (!ss.length) continue;
+    rows.push({ kind: "group", mux, count: ss.length });
+    for (const s of ss) rows.push({ kind: "session", mux, s });
+  }
+  return rows;
+}
+function agentRows() {
+  const rows = [];
+  for (const mux of ctx().groups) {
+    const as = AGENTS.filter(a => a.mux === mux && DATA[mux].some(s => s.name === a.session) && matchA(a));
+    if (!as.length) continue;
+    rows.push({ kind: "group", mux, count: as.length });
+    for (const a of as) rows.push({ kind: "agent", mux, a });
+  }
+  return rows;
+}
+function treeRows() {
+  const rows = [];
+  for (const mux of ctx().groups) {
+    const block = [];
+    for (const s of DATA[mux]) {
+      const as = agentsOf(mux, s.name);
+      const sm = matchS(s), am = as.filter(matchA);
+      if (!sm && !am.length) continue;
+      const shown = sm ? as : am;
+      const folded = state.folded.has(mux + "/" + s.name) && !q();
+      block.push({ kind: "session", mux, s, nAgents: as.length, folded });
+      if (!folded) shown.forEach((a, i) => block.push({ kind: "agent", mux, a, nested: true, last: i === shown.length - 1 }));
+    }
+    if (block.length) rows.push({ kind: "group", mux, count: block.filter(r => r.kind === "session").length }, ...block);
+  }
+  return rows;
+}
+const selectable = rows => rows.filter(r => r.kind !== "group");
+function listFor(name) { return name === "sessions" ? sessionRows() : name === "agents" ? agentRows() : treeRows(); }
+function activeList() { return state.layout === "B" ? "tree" : state.focus; }
+function clampCursors() {
+  for (const k of ["sessions", "agents", "tree"]) {
+    const n = selectable(listFor(k)).length;
+    state.cur[k] = Math.max(0, Math.min(state.cur[k], n - 1));
+  }
+}
+function selected() {
+  const items = selectable(listFor(activeList()));
+  return items[state.cur[activeList()]] || null;
+}
+
+// ---------------------------------------------------------------- row painters
+function groupRow(r, w) {
+  return lr([S(" " + r.mux, "mx-" + r.mux)], [S(String(r.count) + " ", "muted")], w);
+}
+function sessionMeta(r, w) {
+  const s = r.s;
+  if (s.exited) return [S("exited " + s.age + " ", "exited")];
+  const n = agentsOf(r.mux, s.name).length;
+  const unit = r.mux === "tmux" ? "win" : "tab";
+  const out = [];
+  if (n) out.push(S("◆" + n + " ", "agent"));
+  if (w >= 34) out.push(S(s.tabs.length + " " + unit + (s.tabs.length > 1 ? "s" : "") + " ", "muted"));
+  return out;
+}
+function sessionRow(r, w, sel, focused, treeMode = false) {
+  const s = r.s, cur = isCurrent(r.mux, s.name);
+  const lead = treeMode ? (r.nAgents ? (r.folded ? "▸ " : "▾ ") : "  ") : "";
+  const left = [S("  " + lead), S(cur ? "* " : "  ", "cur"), S(s.name, s.exited ? "exited" : (cur ? "b" : ""))];
+  if (s.attached && !cur && w >= 40) left.push(S(" (attached)", "muted"));
+  const line = lr(left, sessionMeta(r, w), w);
+  return sel ? paint(line, focused ? "sel" : "sel-dim") : line;
+}
+function agentRight(a, w) {
+  if (a.status) return [S(STATUS_GLYPH[a.status] + (w >= 40 ? " " + a.status : "") + " ", "st-" + a.status)];
+  return [];
+}
+function agentRow(r, w, sel, focused) {
+  const a = r.a;
+  const lead = r.nested ? "     " + (r.last ? "└ " : "├ ") : "  ";
+  const left = [S(lead, "muted"), S("◆ ", "agent"), S(pad(a.agent, 8), "agent")];
+  if (r.nested) left.push(S(a.tab, "subtle"));
+  else left.push(S(a.session, ""), S(" › " + a.tab, "muted"));
+  const line = lr(left, agentRight(a, w), w);
+  return sel ? paint(line, focused ? "sel" : "sel-dim") : line;
+}
+function listLines(rows, w, h, cursor, focused, treeMode = false) {
+  const items = selectable(rows);
+  const selItem = items[cursor];
+  const selRow = rows.indexOf(selItem);
+  const drawn = scroll(rows, selRow, h);
+  if (!rows.length) return [[S("  no match for “" + state.filter + "”", "muted")]];
+  return drawn.map(r => {
+    const sel = r === selItem;
+    if (r.kind === "group") return groupRow(r, w);
+    if (r.kind === "session") return sessionRow(r, w, sel, focused, treeMode);
+    return agentRow(r, w, sel, focused);
+  });
+}
+
+// ---------------------------------------------------------------- previews
+function shellScreen(s) {
+  const dir = s.cwd;
+  return [
+    [S(dir, "ps-dir"), S(" main", "ps-git")],
+    [S("❯ "), S("git status -sb")],
+    [S("## main...origin/main")],
+    [S(" M README.md", "warn")],
+    [S("")],
+    [S(dir, "ps-dir"), S(" main", "ps-git")],
+    [S("❯ "), S("ls")],
+    [S("README.md  bin  config  flake.nix  home  nixos", "subtle")],
+    [S("")],
+    [S(dir, "ps-dir"), S(" main", "ps-git")],
+    [S("❯ "), S(" ", "caret")],
+  ];
+}
+function agentScreen(a) {
+  const byAgent = {
+    claude: [[S("> add a preview pane to the dashboard", "b")], [S("")],
+      [S("● ", "st-idle"), S("Read(dashboard.py)")], [S("  ⎿  Read 412 lines", "muted")],
+      [S("● ", "st-idle"), S("Update(dashboard.py)")], [S("  ⎿  18 additions and 4 removals", "muted")],
+      [S("")], [S("✻ Thinking…", "st-working")]],
+    codex: [[S("› explain the popup placement code", "b")], [S("")],
+      [S("• Explored", "st-idle")], [S("  └ Read popup.sh, ui.rs", "muted")], [S("")],
+      [S("The popup is placed below the cursor when it fits, else above.")]],
+    opencode: [[S("  opencode  ", "tab-on"), S("  build · claude-opus-5-5", "muted")], [S("")],
+      [S("  Waiting for input.", "subtle")]],
+    pi: [[S("pi", "b"), S("  ~/Desktop/personal-projects", "muted")], [S("")],
+      [S("Allow bash: rm -rf target/ ?  [y/N]", "st-blocked")]],
+    gemini: [[S("✦ ", "iris"), S("Summarize the open PRs", "b")], [S("")], [S("  3 PRs are open; #41 is ready to merge.")]],
+  };
+  return byAgent[a.agent] || [[S(a.agent)]];
+}
+function previewFor(item) {
+  if (!item) return { title: "Preview", lines: [] };
+  if (item.kind === "agent") {
+    const a = item.a;
+    return { title: `${a.mux} › ${a.session} › ${a.tab}`, lines: agentScreen(a) };
+  }
+  const s = item.s;
+  if (s.exited) return { title: `${item.mux} › ${s.name}`, lines: [[S("")], [S("  This session exited " + s.age + " ago.", "subtle")], [S("  Enter resurrects it; x deletes it.", "subtle")]] };
+  const as = agentsOf(item.mux, s.name).filter(a => a.tab === s.tabs[0]);
+  return { title: `${item.mux} › ${s.name} › ${s.tabs[0]}`, lines: as.length ? agentScreen(as[0]) : shellScreen(s) };
+}
+function previewBox(w, h) {
+  const p = previewFor(selected());
+  const body = p.lines.map(l => [S(" "), ...l]);
+  return box([S(" Preview ", "title"), S("· " + p.title + " ", "muted")], body, w, h, false);
+}
+function detailLine(w) {
+  const it = selected();
+  if (!it) return fit([], w);
+  if (it.kind === "agent") {
+    const a = it.a, s = DATA[a.mux].find(x => x.name === a.session);
+    return fit([S(" " + a.agent, "agent"), S(" in " + a.mux + " › " + a.session + " › " + a.tab + " · " + (s ? s.cwd : ""), "subtle"), S(" · pane " + a.pane, "muted")], w);
+  }
+  const s = it.s;
+  return fit([S(" " + s.name, "b"), S(" · " + s.cwd + " · " + s.tabs.length + (it.mux === "tmux" ? " windows" : " tabs") + (s.age ? " · " + s.age + " old" : ""), "subtle")], w);
+}
+
+// ---------------------------------------------------------------- footer
+function hints(w) {
+  const keys = { A: [["↵", "switch"], ["⇥", "focus"]], B: [["↵", "switch"], ["h/l", "fold"]], C: [["↵", "switch"], ["⇥", "focus"]], D: [["↵", "switch"], ["⇥", "tab"]] }[state.layout]
+    .concat([["/", "filter"], ["n", "new"], ["r", "rename"], ["x", "kill"], ["q", "quit"]]);
+  const left = [];
+  for (const [k, v] of keys) {
+    const piece = [S(" " + k, "hint-k"), S(" " + v + " ", "muted")];
+    if (len(left) + len(piece) > w - 16) break;
+    left.push(...piece);
+  }
+  const right = [S(state.filter ? " /" + state.filter + " " : "", "prompt"), S(" " + ctx().label.toLowerCase() + " ", "muted")];
+  return lr(left, right, w);
+}
+function footer(w) {
+  const caret = S(" ", "caret");
+  if (state.mode === "filter") return fit([S(" / ", "prompt"), S(state.input), caret, S("   ↵ keep  esc clear", "muted")], w);
+  if (state.mode === "rename") return fit([S(` Rename ${state.target.mux} session “${state.target.s.name}”: `, "prompt"), S(state.input), caret], w);
+  if (state.mode === "new") return fit([S(` New ${state.target} session (empty = from directory): `, "prompt"), S(state.input), caret], w);
+  if (state.mode === "kill") {
+    const t = state.target, verb = t.s.exited ? "Delete exited" : "Kill";
+    const extra = isCurrent(t.mux, t.s.name) ? " (the current session)" : "";
+    return fit([S(` ${verb} ${t.mux} session “${t.s.name}”${extra}? `, "warn"), S("y/N", "hint-k")], w);
+  }
+  if (state.toast) return fit([S(" " + state.toast.text, state.toast.cls)], w);
+  return hints(w);
+}
+
+// ---------------------------------------------------------------- layouts
+function layoutA(w, h) {
+  const H = h - 1, wide = w >= 70;
+  const lw = wide ? Math.min(42, Math.floor(w * 0.4)) : w;
+  const sh = Math.ceil(H * 0.55), ah = H - sh;
+  const fS = state.focus === "sessions", fA = !fS;
+  const sBox = box("Sessions", listLines(sessionRows(), lw - 2, sh - 2, state.cur.sessions, fS), lw, sh, fS);
+  const aBox = box("Agents", listLines(agentRows(), lw - 2, ah - 2, state.cur.agents, fA), lw, ah, fA);
+  const left = [...sBox, ...aBox];
+  return wide ? hjoin(left, previewBox(w - lw, H)) : left;
+}
+function layoutB(w, h) {
+  const H = h - 1, withPreview = h >= 22;
+  const th = withPreview ? Math.ceil(H * 0.55) : H;
+  const tree = box("Sessions & agents", listLines(treeRows(), w - 2, th - 2, state.cur.tree, true, true), w, th, true);
+  return withPreview ? [...tree, ...previewBox(w, H - th)] : tree;
+}
+function layoutC(w, h) {
+  const H = h - 2, lw = Math.ceil(w / 2);
+  const fS = state.focus === "sessions";
+  const sBox = box("Sessions", listLines(sessionRows(), lw - 2, H - 2, state.cur.sessions, fS), lw, H, fS);
+  const aBox = box("Agents", listLines(agentRows(), w - lw - 2, H - 2, state.cur.agents, !fS), w - lw, H, !fS);
+  return [...hjoin(sBox, aBox), detailLine(w)];
+}
+function tableSessions(w, h) {
+  const showCwd = w >= 72;
+  const nameW = Math.max(12, Math.min(22, w - 29));
+  const cols = [["NAME", nameW], ["MUX", 8], ["TABS", 6], ["AGENTS", 8], ["AGE", 6]];
+  const head = cols.map(([n, cw]) => pad(n, cw)).join("") + (showCwd ? "DIRECTORY" : "");
+  const rows = sessionRows().filter(r => r.kind === "session");
+  const sel = rows[state.cur.sessions];
+  const lines = scroll(rows, rows.indexOf(sel), h - 1).map(r => {
+    const s = r.s, cur = isCurrent(r.mux, s.name), n = agentsOf(r.mux, s.name).length;
+    const line = fit([
+      S(cur ? "*" : " ", "cur"), S(pad(s.name, nameW - 1), s.exited ? "exited" : (cur ? "b" : "")),
+      S(pad(r.mux, 8), "mx-" + r.mux), S(pad(s.exited ? "–" : String(s.tabs.length), 6), "muted"),
+      S(pad(n ? "◆" + n : "", 8), "agent"), S(pad(s.exited ? "exited" : s.age, 6), s.exited ? "exited" : "muted"),
+      S(showCwd ? s.cwd : "", "subtle")], w);
+    return r === sel ? paint(line, "sel") : line;
+  });
+  return [fit([S(" " + head, "hdr")], w), ...(rows.length ? lines : [[S("  no match", "muted")]])];
+}
+function tableAgents(w, h) {
+  const sessW = Math.max(12, Math.min(22, w - 47)), tabW = w < 80 ? 10 : 18;
+  const cols = [["AGENT", 10], ["SESSION", sessW], ["TAB", tabW], ["MUX", 8], ["STATUS", 10]];
+  const head = cols.map(([n, cw]) => pad(n, cw)).join("");
+  const rows = agentRows().filter(r => r.kind === "agent");
+  const sel = rows[state.cur.agents];
+  const lines = scroll(rows, rows.indexOf(sel), h - 1).map(r => {
+    const a = r.a;
+    const line = fit([S(" "), S(pad(a.agent, 10), "agent"), S(pad(a.session, sessW)), S(pad(a.tab, tabW), "muted"),
+      S(pad(a.mux, 8), "mx-" + a.mux),
+      S(a.status ? STATUS_GLYPH[a.status] + " " + a.status : "–", a.status ? "st-" + a.status : "muted")], w);
+    return r === sel ? paint(line, "sel") : line;
+  });
+  return [fit([S(" " + head, "hdr")], w), ...(rows.length ? lines : [[S("  no match", "muted")]])];
+}
+function layoutD(w, h) {
+  const H = h - 1;
+  const nS = selectable(sessionRows()).length, nA = selectable(agentRows()).length;
+  const fS = state.focus === "sessions";
+  const tabs = [S(" Sessions " + nS + " ", fS ? "tab-on" : "tab-off"), S("─", "bd-focus"), S(" Agents " + nA + " ", fS ? "tab-off" : "tab-on")];
+  const body = fS ? tableSessions(w - 2, H - 2) : tableAgents(w - 2, H - 2);
+  return box(tabs, body, w, H, true);
+}
+
+// ---------------------------------------------------------------- render
+const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+const toHTML = lines => lines.map(l => '<div class="ln">' + l.map(s => s.c ? `<span class="${s.c}">${esc(s.t)}</span>` : esc(s.t)).join("") + "</div>").join("");
+
+function background(cols, rows) {
+  const src = [
+    "  1 local M = {}", "  2", "  3 --- Open the dashboard in a floating pane.", "  4 function M.open(opts)",
+    "  5   opts = vim.tbl_extend('force', { width = 0.6 }, opts or {})", "  6   local buf = vim.api.nvim_create_buf(false, true)",
+    "  7   vim.api.nvim_open_win(buf, true, M.geometry(opts))", "  8 end", "  9", " 10 return M",
+  ];
+  const lines = [];
+  for (let i = 0; i < rows; i++) lines.push([S(i < src.length ? src[i] : (i === rows - 1 ? " NORMAL  dashboard.lua  lua  10:1" : "~"))]);
+  return lines.map(l => fit(l, cols));
+}
+
+function render() {
+  clampCursors();
+  const [w, h] = SIZES[state.size];
+  const lines = { A: layoutA, B: layoutB, C: layoutC, D: layoutD }[state.layout](w, h);
+  lines.push(footer(w));
+  document.getElementById("popup").innerHTML = toHTML(lines.map(l => fit(l, w)));
+  document.getElementById("bg").innerHTML = toHTML(background(w + 16, h + 6));
+
+  document.querySelectorAll("#layouts button").forEach(b => b.setAttribute("aria-pressed", b.dataset.v === state.layout));
+  document.querySelectorAll("#ctx button").forEach(b => b.setAttribute("aria-pressed", b.dataset.v === state.ctx));
+  document.querySelectorAll("#size button").forEach(b => b.setAttribute("aria-pressed", b.dataset.v === state.size));
+  document.getElementById("ctxnote").textContent = ctx().note;
+
+  const [lead, pts] = LAYOUTS[state.layout].notes;
+  document.getElementById("notes").innerHTML = `<h2>About this layout</h2><p>${lead}</p><ul>${pts.map(p => `<li>${p}</li>`).join("")}</ul>`;
+  const log = document.getElementById("log");
+  if (state.log.length) log.innerHTML = state.log.map(e => `<div>${esc(e)}</div>`).join("");
+}
+
+// ---------------------------------------------------------------- actions
+const sanitize = n => n.replace(/[^A-Za-z0-9_~-]/g, "-");
+function say(text, cls = "toast") {
+  state.toast = { text, cls };
+  clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(() => { state.toast = null; render(); }, 3500);
+}
+function run(cmds, closes) {
+  const where = ctx().label.toLowerCase();
+  state.log.unshift(`# ${where}\n` + cmds.join("\n") + (closes ? "\n# the dashboard exits" : ""));
+  say("→ " + cmds[cmds.length - 1] + (closes ? "   (popup closes)" : ""));
+}
+function switchCmds(it) {
+  if (it.kind === "session") {
+    const s = it.s, inside = isInside(it.mux);
+    if (it.mux === "tmux") return [inside ? `tmux switch-client -c "$client" -t '=${s.name}'` : `exec tmux attach-session -t '=${s.name}'`];
+    if (it.mux === "zellij") {
+      const c = inside ? `zellij action switch-session '${s.name}'` : `exec zellij attach '${s.name}'`;
+      return [c + (s.exited ? "    # resurrects it" : "")];
+    }
+    return [`herdr workspace focus ${s.id}`].concat(inside ? [] : ["exec herdr"]);
+  }
+  const a = it.a, inside = isInside(a.mux);
+  if (a.mux === "tmux") return inside ? [`tmux switch-client -c "$client" -t '${a.pane}'`]
+    : [`tmux select-window -t '${a.pane}' \\; select-pane -t '${a.pane}'`, `exec tmux attach-session -t '${a.pane}'`];
+  if (a.mux === "zellij") {
+    if (!inside) return [`zellij --session '${a.session}' action focus-pane-id ${a.pane}`, `exec zellij attach '${a.session}'`];
+    return isCurrent("zellij", a.session) ? [`zellij action focus-pane-id ${a.pane}`] : [`zellij action switch-session '${a.session}' --pane-id ${a.pane}`];
+  }
+  return [`herdr agent focus ${a.pane}`].concat(inside ? [] : ["exec herdr"]);
+}
+function doRename(it, name) {
+  const old = it.s.name, n = sanitize(name);
+  if (!n || n === old) return;
+  const cmd = { tmux: `tmux rename-session -t '=${old}' '${n}'`, zellij: `zellij --session '${old}' action rename-session '${n}'`, herdr: `herdr workspace rename ${it.s.id} '${n}'` }[it.mux];
+  AGENTS.forEach(a => { if (a.mux === it.mux && a.session === old) a.session = n; });
+  if (ctx().current[it.mux] === old) ctx().current[it.mux] = n;
+  it.s.name = n;
+  run([cmd], false);
+}
+function doKill(it) {
+  const s = it.s;
+  const cmd = { tmux: `tmux kill-session -t '=${s.name}'`, zellij: s.exited ? `zellij delete-session '${s.name}'` : `zellij kill-session '${s.name}'`, herdr: `herdr workspace close ${s.id}` }[it.mux];
+  DATA[it.mux].splice(DATA[it.mux].indexOf(s), 1);
+  for (let i = AGENTS.length - 1; i >= 0; i--) if (AGENTS[i].mux === it.mux && AGENTS[i].session === s.name) AGENTS.splice(i, 1);
+  run([cmd], false);
+}
+function doNew(mux, name) {
+  const dir = "~/Desktop/personal-projects/multiplexer-dashboard";
+  let n = sanitize(name || "multiplexer-dashboard");
+  const base = n; let i = 1;
+  while (DATA[mux].some(s => s.name === n)) { n = base + "-" + i++; }
+  const inside = isInside(mux);
+  const cmds = {
+    tmux: inside ? [`tmux new-session -d -s '${n}' -c ${dir}`, `tmux switch-client -c "$client" -t '=${n}'`] : [`exec tmux new-session -s '${n}' -c ${dir}`],
+    zellij: inside ? [`zellij action switch-session '${n}' --cwd ${dir}`] : [`cd ${dir} && exec zellij --session '${n}'`],
+    herdr: [`herdr workspace create --cwd ${dir} --label '${n}' --focus`].concat(inside ? [] : ["exec herdr"]),
+  }[mux];
+  DATA[mux].push({ name: n, id: "wNEW", tabs: ["1"], cwd: dir, age: "0s" });
+  if (base !== sanitize(name || "multiplexer-dashboard") || n !== base) cmds.unshift(`# “${base}” exists, so the name gets a suffix`);
+  run(cmds, true);
+}
+
+function move(d) {
+  const k = activeList(), n = selectable(listFor(k)).length;
+  if (!n) return;
+  state.cur[k] = d === "first" ? 0 : d === "last" ? n - 1 : Math.max(0, Math.min(n - 1, state.cur[k] + d));
+}
+function sessionOf(it) {
+  if (!it) return null;
+  if (it.kind === "session") return it;
+  const s = DATA[it.a.mux].find(x => x.name === it.a.session);
+  return s ? { kind: "session", mux: it.a.mux, s } : null;
+}
+
+function key(e) {
+  const k = e.key;
+  if (state.mode) {
+    if (state.mode === "kill") {
+      if (k === "y" || k === "Y") doKill(state.target);
+      state.mode = null; return true;
+    }
+    if (k === "Escape") {
+      if (state.mode === "filter") state.filter = "";
+      state.mode = null; state.input = ""; return true;
+    }
+    if (k === "Enter" || (state.mode === "filter" && (k === "ArrowDown" || k === "ArrowUp"))) {
+      const v = state.input, m = state.mode;
+      state.mode = null; state.input = "";
+      if (m === "rename") doRename(state.target, v);
+      if (m === "new") doNew(state.target, v);
+      if (m === "filter" && k !== "Enter") move(k === "ArrowDown" ? 1 : -1);
+      return true;
+    }
+    if (k === "Backspace") { state.input = state.input.slice(0, -1); }
+    else if (k.length === 1 && !e.ctrlKey && !e.metaKey) { state.input += k; }
+    else return false;
+    if (state.mode === "filter") { state.filter = state.input; for (const c in state.cur) state.cur[c] = 0; }
+    return true;
+  }
+  switch (k) {
+    case "j": case "ArrowDown": move(1); break;
+    case "k": case "ArrowUp": move(-1); break;
+    case "g": case "Home": move("first"); break;
+    case "G": case "End": move("last"); break;
+    case "Tab":
+      if (state.layout !== "B") state.focus = state.focus === "sessions" ? "agents" : "sessions";
+      break;
+    case "h": case "ArrowLeft": case "l": case "ArrowRight": {
+      if (state.layout !== "B") return false;
+      const it = sessionOf(selected());
+      if (!it) break;
+      const id = it.mux + "/" + it.s.name, fold = k === "h" || k === "ArrowLeft";
+      if (fold) state.folded.add(id); else state.folded.delete(id);
+      // Keep the cursor on the session row after folding.
+      if (fold) state.cur.tree = selectable(treeRows()).findIndex(r => r.kind === "session" && r.s === it.s);
+      break;
+    }
+    case "Enter": { const it = selected(); if (it) run(switchCmds(it), true); break; }
+    case "/": state.mode = "filter"; state.input = state.filter; break;
+    case "n": {
+      const it = selected();
+      state.target = it ? it.mux : ctx().groups[0];
+      state.mode = "new"; state.input = ""; break;
+    }
+    case "r": {
+      const it = selected();
+      if (!it || it.kind !== "session") { say("Rename applies to a session row.", "warn"); break; }
+      if (it.s.exited) { say("An exited zellij session cannot be renamed.", "warn"); break; }
+      state.target = it; state.mode = "rename"; state.input = it.s.name; break;
+    }
+    case "x": {
+      const it = selected();
+      if (!it || it.kind !== "session") { say("Kill applies to a session row.", "warn"); break; }
+      state.target = it; state.mode = "kill"; break;
+    }
+    case "q": case "Escape":
+      if (state.filter) { state.filter = ""; break; }
+      run(["exit 0"], true); break;
+    default: return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------- controls
+function buttons(id, entries, onPick) {
+  const el = document.getElementById(id);
+  el.innerHTML = "";
+  for (const [v, label, desc] of entries) {
+    const b = document.createElement("button");
+    b.type = "button"; b.dataset.v = v;
+    b.innerHTML = desc ? `<b>${label}</b><span>${desc}</span>` : label;
+    b.addEventListener("click", () => { onPick(v); render(); document.getElementById("term").focus(); });
+    el.appendChild(b);
+  }
+}
+buttons("layouts", Object.entries(LAYOUTS).map(([k, l]) => [k, l.name, l.desc]), v => { state.layout = v; state.mode = null; state.filter = ""; });
+buttons("ctx", Object.entries(CONTEXTS).map(([k, c]) => [k, c.label]), v => { state.ctx = v; state.mode = null; state.filter = ""; });
+buttons("size", [["L", "112×30"], ["M", "90×24"], ["S", "62×20"]], v => { state.size = v; });
+buttons("theme", [["auto", "Auto"], ["light", "Dawn"], ["dark", "Rose Pine"]], v => {
+  if (v === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", v);
+  document.querySelectorAll("#theme button").forEach(b => b.setAttribute("aria-pressed", b.dataset.v === v));
+});
+document.querySelector('#theme button[data-v="auto"]').setAttribute("aria-pressed", "true");
+
+const term = document.getElementById("term");
+term.addEventListener("keydown", e => { if (key(e)) { e.preventDefault(); render(); } });
+term.addEventListener("focus", () => document.getElementById("focushint").textContent = "Keys go to the popup. Press Tab inside the popup to switch lists; click outside to leave.");
+term.addEventListener("blur", () => document.getElementById("focushint").textContent = "Click the terminal to send keys to the popup.");
+render();
+</script>
+</body>
