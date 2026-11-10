@@ -89,7 +89,7 @@ Filtering and navigation
 
 37. As a user, I want `/` to filter both lists as I type, matching session names and agent names, sessions and tabs, so that I can narrow a long list quickly.
 38. As a user, I want Escape to clear the filter, and Enter to keep it and go back to moving, so that filtering never traps me.
-39. As a user, I want j/k and the arrow keys to move, g/G and Home/End to jump to the ends, and Tab to switch between the lists.
+39. As a user, I want j/k and the up/down keys to move, g/G and Home/End to jump to the ends, and Tab to switch between the lists.
 40. As a user, I want Alt+j/k (or Alt+arrows) to jump to the next or previous multiplexer group, so that I can move quickly in a long list.
 41. As a user, I want to click a row to select it, click it again to switch, and scroll a list with the mouse wheel.
 42. As a user, I want the lists to scroll only when the cursor leaves the view, so that a row does not move away from the mouse pointer.
@@ -109,7 +109,7 @@ Managing sessions
 Freshness and speed
 
 52. As a user, I want the dashboard to open at once and fill in the lists as soon as the multiplexers answer, so that a slow multiplexer does not block the others.
-53. As a user, I want the lists refreshed every few seconds while the dashboard is open, and on Ctrl+R, so that new agents and sessions appear without reopening it.
+53. As a user, I want the lists refreshed every few seconds while the dashboard is open, and on Ctrl+L, so that new agents and sessions appear without reopening it and a garbled screen can be repainted.
 54. As a user, I want the preview to update shortly after the cursor stops, without making the cursor lag.
 55. As a user, I want a multiplexer that is not installed to be left out, and one that fails (such as a herdr server that is not running) to show the reason in its group header, so that one broken multiplexer does not break the dashboard.
 
@@ -204,7 +204,7 @@ Actions (built as argument lists; the prototype's command log holds the full mat
 Loading, refresh and preview
 
 - The first frame draws at once with empty groups marked as loading. A worker thread loads each multiplexer's snapshot and posts it to the main loop through a queue, and the main loop's `select` wakes on a self-pipe.
-- The snapshot is reloaded every 2 seconds while the dashboard is open, and on Ctrl+R. A reload keeps each cursor on the same session or agent when it still exists.
+- The snapshot is reloaded every 2 seconds while the dashboard is open, and on Ctrl+L, which also forces a full redraw. A reload keeps each cursor on the same session or agent when it still exists.
 - The preview is captured 100 ms after the cursor stops, on a worker thread, and cached per pane until the next refresh:
   - tmux: `capture-pane -e -p -t PANE`, or `-t =SESSION:` for a session's active pane.
   - zellij: `zellij --session SESSION action dump-screen --ansi --pane-id PANE`. Checked to work from outside the session.
@@ -215,10 +215,10 @@ Loading, refresh and preview
 Key bindings and flags
 
 - Keys:
-  - j/k and arrows move. g/G and Home/End jump to the ends. Alt+j/k and Alt+arrows jump between groups.
-  - Tab, Shift+Tab, h/l and left/right switch between the lists.
+  - j/k and up/down move. g/G and Home/End jump to the ends. Alt+j/k and Alt+up/down jump between groups.
+  - Tab switches between the lists.
   - Enter switches. `/` filters. `n` creates, `r` renames, `x` kills.
-  - Ctrl+R refreshes, `?` opens the help, q or Escape quits, and Ctrl+C always quits.
+  - Ctrl+L refreshes and redraws the screen, `?` opens the help, q or Escape quits, and Ctrl+C always quits.
 - Mouse: a click selects, a click on the selected row switches, and the wheel moves the cursor in the list under the pointer.
 - Flags: `--multiplexer tmux|zellij|herdr`, `--client CLIENT` (tmux), `--dir DIR` (new sessions), `--theme auto|light|dark`, and `--no-bg`.
 

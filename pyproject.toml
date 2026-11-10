@@ -1,0 +1,8 @@
+# Tool settings only. The app is the single script `multiplexer-dashboard`,
+# which must run on Python 3.9 or later with the standard library alone.
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.pyrefly]
+python-version = "3.9"
