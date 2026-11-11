@@ -8,7 +8,7 @@ Usage: multiplexer-dashboard [--multiplexer tmux|zellij|herdr]
                              [--sidebar]
 
 The left column lists sessions above agents, both grouped by multiplexer in
-the order zellij, herdr, tmux. The right side previews the selected
+the order zellij, tmux, herdr. The right side previews the selected
 session's focused pane or the selected agent's pane, in that pane's own
 colors. Enter switches to the selected session or jumps to the selected
 agent's pane, and the dashboard then exits.
@@ -83,7 +83,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple
 
-MULTIPLEXERS = ("zellij", "herdr", "tmux")
+MULTIPLEXERS = ("zellij", "tmux", "herdr")
 SCRIPT = os.path.abspath(__file__)
 SESSIONS, AGENTS = 0, 1
 REFRESH_SECONDS = 2.0
@@ -1926,7 +1926,7 @@ class App:
         self.selection_since = 0.0
         # In a sidebar inside a multiplexer, the dashboard stays open after
         # a switch, and Escape runs the back command of the first
-        # multiplexer it runs in, in the order zellij, herdr, tmux, that has
+        # multiplexer it runs in, in the order zellij, tmux, herdr, that has
         # one.
         self.stays_open = options.sidebar and bool(ctx.inside)
         enclosing = [

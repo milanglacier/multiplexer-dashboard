@@ -423,7 +423,7 @@ class ContextTest(unittest.TestCase):
 
     def test_outside_lists_installed_in_order(self):
         ctx = md.detect_context({}, self.installed("tmux", "zellij", "herdr"))
-        self.assertEqual(ctx.listed, ["zellij", "herdr", "tmux"])
+        self.assertEqual(ctx.listed, ["zellij", "tmux", "herdr"])
         self.assertEqual(ctx.inside, set())
         self.assertEqual(ctx.label, "outside any multiplexer")
         ctx = md.detect_context({}, self.installed("tmux"))
@@ -862,12 +862,12 @@ class ActionsTest(unittest.TestCase):
         )
 
     def test_new_dialog_cycles_the_multiplexers(self):
-        app = make_app(listed=("zellij", "herdr", "tmux"))
+        app = make_app(listed=("zellij", "tmux", "herdr"))
         app.handle(md.Event("key", "n"))
         self.assertEqual(app.new_mux, "zellij")
         app.handle(md.Event("key", "tab"))
         app.handle(md.Event("key", "tab"))
-        self.assertEqual(app.new_mux, "tmux")
+        self.assertEqual(app.new_mux, "herdr")
         app.handle(md.Event("key", "tab"))
         self.assertEqual(app.new_mux, "zellij")
 

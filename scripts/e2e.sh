@@ -268,13 +268,13 @@ fi
 
 # ---------------------------------------------------------------- outside
 
-step "outside: every multiplexer, in the order zellij, herdr, tmux"
+step "outside: every multiplexer, in the order zellij, tmux, herdr"
 open_outside out
 w=e2e:out
 wait_for $w "✦ gemini" && echo "ok: an agent that runs in node is found by its argument"
 wait_for $w "↯ amp" >/dev/null
 rows=""
-for m in zellij herdr tmux; do
+for m in zellij tmux herdr; do
     have $m && rows+="$(row_of $w "│ $m ─") "
 done
 check "groups in order" "$(tr ' ' '\n' <<<"$rows" | grep . | sort -n | tr '\n' ' ')" "$rows"
@@ -288,10 +288,10 @@ check "the cursor starts on the first session" \
     "$(screen $w | grep -A1 -m1 '│ [a-z]* ─' | tail -1 | grep -c '▌')" 1
 
 step "outside: Alt keys jump between multiplexers"
-if have zellij && have herdr; then
+if have zellij; then
     first=$(selected $w)
     t send-keys -t $w M-j
-    wait_for $w "▌   hone" && echo "ok: alt+j"
+    wait_for $w "▌   alpha" && echo "ok: alt+j"
     t send-keys -t $w M-k
     wait_for $w "▌   $first" && echo "ok: alt+k"
 fi
