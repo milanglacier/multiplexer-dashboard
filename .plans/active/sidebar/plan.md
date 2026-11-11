@@ -67,7 +67,7 @@ Staying open
 Narrow layout
 
 13. As a user, I want the lists without the preview at every width, so that widening the pane does not bring the preview back.
-14. As a user with a 30-column pane, I want a one-line header with the context and the counts, without the title pill.
+14. As a user with a narrow pane, I want no header, so that the lists get every row. The panel titles and their counts already say what each list holds.
 15. As a user, I want the footer to show `esc back` instead of `q quit`.
 16. As a user, I want the pane to work down to about 24×10 cells, and show the size message only below that.
 17. As a user, I want agent rows to keep the agent name and session, and drop the tab when the row is too narrow.
@@ -112,15 +112,15 @@ Focus and refresh
   - tmux: `tmux display-message -p -t $TMUX_PANE '#{window_active} #{session_attached}'`. The pane is visible when both are nonzero.
   - herdr: no check. The pane counts as always visible.
 - `App.timeout` includes the next visibility check, so the main loop wakes for it.
-- The 0.1 s wake for herdr's spinner runs only while visible.
+- Keys, resizes and new data already wake the main loop at once, so the 0.5 s upper bound in `App.timeout` has no timed work behind it. In sidebar mode, that bound applies only while focused. Without focus, the loop waits until the next visibility check or the next full load, so that a pane in a hidden tab does not redraw twice a second.
 
 View
 
 - In sidebar mode, the body is the two lists at full width at any number of columns.
-- The header is one line: the context label and the session and agent counts, without the gradient pill. When even that does not fit, the counts go first.
+- There is no header in sidebar mode. The lists start on the first row.
 - The footer's last key is `esc back` instead of `q quit`. The help dialog says the same.
 - The minimum size is 24×10 in sidebar mode, and 40×12 otherwise.
-- `agent_row` drops ` › TAB` before it cuts the session name, when the row is narrower than the name, session and tab.
+- `agent_row` drops ` › TAB` before it cuts the session name, when the row is narrower than the name, session and tab. The name column keeps the width from `agent_name_width` in every mode, so that the names line up.
 - Dialogs get narrower to fit the pane. The rename, new and kill dialogs are at most `cols - 2` wide.
 
 Processes
@@ -131,6 +131,7 @@ Documentation
 
 - README: a section on keeping the dashboard in a fixed pane, with a zellij `default_tab_template` that keeps the tab bar and status bar, and a tmux split command. It says that every tab runs its own process and that hidden tabs stay cheap.
 - `--help` describes `--sidebar` as "show only the lists; inside a multiplexer, stay open after a switch".
+- Reword the zellij note in AGENTS.md so that it covers layout panes too: `switch-session` and `focus-pane-id` move a client only when they run in a pane with a client behind it, such as a pane opened by a key binding or a layout pane.
 
 Example zellij layout for the README:
 
@@ -153,7 +154,9 @@ layout {
 
 - Unit tests (seam 1):
   - `parse_input` turns `ESC [ I` and `ESC [ O` into focus events, also mixed with keys in one read.
-  - In sidebar mode, `render` draws no preview at 160 columns, uses the short header, draws down to 24×10 and shows the size message below that.
+  - In sidebar mode, `render` draws no preview at 160 columns, draws no header, draws down to 24×10 and shows the size message below that.
+  - In a narrow agent row, the tab goes before the session is cut.
+  - In sidebar mode without focus, `App.timeout` returns the time to the next visibility check or full load, not 0.5 s. With focus, and outside sidebar mode, it still returns at most 0.5 s.
   - In sidebar mode, Enter on a session in another session runs `switch-session` and leaves `result` unset. Enter on the current session and Escape run `focus-last-pane` (zellij) or `last-pane` (tmux). `q` does nothing. Ctrl+C quits.
   - Outside a multiplexer in sidebar mode, Enter still exits with the attaching plan.
   - The refresh times: 2 s focused, 5 s visible, no full load while hidden, an immediate load on focus-in and when the pane becomes visible again. A key press counts as focus.
