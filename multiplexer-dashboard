@@ -27,7 +27,8 @@ opencode, pi, gemini, aider, amp, crush, goose, cursor-agent, qwen, droid and
 copilot, or of the comma-separated names in MULTIPLEXER_DASHBOARD_AGENTS.
 When the foreground program is an interpreter (node, bun, deno or python),
 the name comes from the first argument that is not an option, such as
-".../bin/gemini". Herdr reports its own agents and their status.
+".../bin/gemini". Herdr reports its own agents and their status. Each
+detected agent has its own icon, and every other agent has the icon "◇".
 
 New sessions are named as multiplexer-new-session names them: "~" for the
 home directory, the name of the repository's root directory inside a git
@@ -745,23 +746,34 @@ class Plan:
 
 # ---------------------------------------------------------------- agents
 
-DEFAULT_AGENTS = (
-    "claude",
-    "codex",
-    "opencode",
-    "pi",
-    "gemini",
-    "aider",
-    "amp",
-    "crush",
-    "goose",
-    "cursor-agent",
-    "qwen",
-    "droid",
-    "copilot",
-)
+# The agents that the dashboard detects without MULTIPLEXER_DASHBOARD_AGENTS,
+# each with its icon. Every icon is one cell wide and has no emoji form, so
+# that it lines up in any terminal font.
+AGENT_ICONS = {
+    "claude": "✻",
+    "codex": "◎",
+    "opencode": "▣",
+    "pi": "π",
+    "gemini": "✦",
+    "aider": "▲",
+    "amp": "↯",
+    "crush": "❖",
+    "goose": "◐",
+    "cursor-agent": "➤",
+    "qwen": "◈",
+    "droid": "◉",
+    "copilot": "⊙",
+}
+DEFAULT_AGENTS = tuple(AGENT_ICONS)
+# The icon of any other agent, such as one named in
+# MULTIPLEXER_DASHBOARD_AGENTS or one that herdr reports.
+CUSTOM_AGENT_ICON = "◇"
 INTERPRETER_RE = re.compile(r"node|nodejs|bun|deno|python[0-9.]*")
 SCRIPT_EXT_RE = re.compile(r"\.(?:c?js|mjs|ts|py)$")
+
+
+def agent_icon(name: str) -> str:
+    return AGENT_ICONS.get(name, CUSTOM_AGENT_ICON)
 
 
 def agent_names(env: Mapping[str, str]) -> frozenset[str]:
@@ -2374,7 +2386,7 @@ class View:
         blocked = a.status == "blocked"
         left = (
             pen(" ")
-            + pen("◆ ", t.love if blocked else c)
+            + pen(agent_icon(a.name) + " ", t.love if blocked else c)
             + pen(f"{a.name:<9}", c, bold=is_sel or blocked)
             + pen(a.session, t.text)
             + pen(" › " + a.tab, t.muted)
@@ -2402,7 +2414,7 @@ class View:
                 + " "
             )
             note = "pane " + a.pane
-            info = paint(a.name, t.agent(a.name), bold=True)
+            info = paint(f"{agent_icon(a.name)} {a.name}", t.agent(a.name), bold=True)
             if a.path:
                 info += paint(" · " + self.short_path(a.path), t.subtle)
             st = self.status(a, Pen(), True)

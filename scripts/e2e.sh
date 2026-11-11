@@ -271,8 +271,8 @@ fi
 step "outside: every multiplexer, in the order zellij, herdr, tmux"
 open_outside out
 w=e2e:out
-wait_for $w "◆ gemini" && echo "ok: an agent that runs in node is found by its argument"
-wait_for $w "◆ amp" >/dev/null
+wait_for $w "✦ gemini" && echo "ok: an agent that runs in node is found by its argument"
+wait_for $w "↯ amp" >/dev/null
 rows=""
 for m in zellij herdr tmux; do
     have $m && rows+="$(row_of $w "│ $m ─") "
@@ -300,9 +300,9 @@ step "outside: filter, preview"
 filter $w amp
 t send-keys -t $w Tab
 wait_for $w "fake amp" && echo "ok: the preview shows the agent's pane"
-check "the filter hides other agents" "$(screen $w | grep -c '◆ gemini')" 0
+check "the filter hides other agents" "$(screen $w | grep -c '✦ gemini')" 0
 t send-keys -t $w Escape
-wait_for $w "◆ gemini" >/dev/null && echo "ok: escape clears the filter"
+wait_for $w "✦ gemini" >/dev/null && echo "ok: escape clears the filter"
 
 step "outside: help, ctrl+l"
 t send-keys -t $w '?'
@@ -310,7 +310,7 @@ wait_for $w "next / previous multiplexer" && echo "ok: help"
 t send-keys -t $w x
 wait_gone $w "next / previous multiplexer"
 t send-keys -t $w C-l
-wait_for $w "◆ gemini" >/dev/null && echo "ok: ctrl+l redraws"
+wait_for $w "✦ gemini" >/dev/null && echo "ok: ctrl+l redraws"
 
 step "outside: below 72 columns the preview is hidden"
 t resize-window -t $w -x 70
@@ -483,8 +483,8 @@ sock=$(tm display -p -t alpha: '#{socket_path}')
 t new-window -d -t e2e -n nested \
     "clean env TMUX=$sock,1,0 ZELLIJ=0 ZELLIJ_SESSION_NAME=zone $dash --theme dark; sleep 600"
 wait_for e2e:nested "in zellij and tmux" && echo "ok: the context"
-wait_for e2e:nested "◆ gemini" >/dev/null
-have zellij && wait_for e2e:nested "◆ codex" >/dev/null
+wait_for e2e:nested "✦ gemini" >/dev/null
+have zellij && wait_for e2e:nested "◎ codex" >/dev/null
 check "zellij and tmux listed, without herdr" \
     "$(screen e2e:nested | grep -c -e '│ zellij ─' -e '│ tmux ─' -e '│ herdr ─')" \
     "$(have zellij && echo 4 || echo 2)"
@@ -495,7 +495,7 @@ t kill-window -t e2e:nested
 step "rename and kill, checked through each multiplexer"
 open_outside manage
 w=e2e:manage
-wait_for $w "◆ gemini" >/dev/null
+wait_for $w "✦ gemini" >/dev/null
 filter $w spare
 t send-keys -t $w r
 wait_for $w "Rename session" >/dev/null

@@ -150,7 +150,8 @@ A new session with an empty name is named after the git repository or the
 directory it starts in. If a session with that name exists, the dashboard
 switches to it instead.
 
-To detect more agent programs, list their names:
+Each agent has its own icon. To detect more agent programs, list their
+names. These agents share the icon `◇`:
 
 ```sh
 export MULTIPLEXER_DASHBOARD_AGENTS=kimi,myagent

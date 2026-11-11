@@ -97,6 +97,14 @@ class AgentDetectionTest(unittest.TestCase):
         # A program that is not an interpreter is not looked into.
         self.assertIsNone(md.detect_agent(["vim", "claude"], NAMES))
 
+    def test_icons(self):
+        icons = [md.agent_icon(n) for n in md.DEFAULT_AGENTS]
+        self.assertEqual(len(set(icons)), len(icons))
+        self.assertNotIn(md.CUSTOM_AGENT_ICON, icons)
+        self.assertEqual({md.width(i) for i in icons}, {1})
+        self.assertEqual(md.agent_icon("claude"), "✻")
+        self.assertEqual(md.agent_icon("myagent"), md.CUSTOM_AGENT_ICON)
+
     def test_extra_names_from_the_environment(self):
         names = md.agent_names({"MULTIPLEXER_DASHBOARD_AGENTS": " kimi, ,myagent "})
         self.assertEqual(md.detect_agent(["kimi"], names), "kimi")
@@ -992,7 +1000,7 @@ class ScreenTest(unittest.TestCase):
         self.assertLess(text.index("zellij ─"), text.index("tmux ─"))
         self.assertIn("● monopi", text)
         self.assertIn("exited", text)
-        self.assertIn("◆ claude   dotfiles › main", text)
+        self.assertIn("✻ claude   dotfiles › main", text)
         self.assertIn("?  help", lines[-1])
 
     def test_narrow_hides_the_preview(self):
