@@ -112,14 +112,19 @@ height = 40
 ## Keep it open in a sidebar
 
 `multiplexer-dashboard --sidebar` shows only the Sessions and Agents lists,
-so it fits a pane of about 30 columns. Inside a multiplexer it stays open:
-Enter takes you to the session or agent and the pane stays, Escape gives
-focus back to the pane you came from, and `q` quits.
+so it fits a narrow pane of about 30 columns. It stays open after you
+switch: Enter takes you to the session or agent, Escape goes back to the
+pane you came from, and `q` quits.
 
-zellij: to give every tab of every session a sidebar, including the sessions
-that you create with `n`, add a `new_tab_template` to your default layout,
-`~/.config/zellij/layouts/default.kdl`. This one keeps the tab bar and the
-status bar:
+tmux (`~/.tmux.conf`), to open a sidebar on the left of the current window:
+
+```tmux
+set -g focus-events on
+bind b split-window -hbf -l 32 multiplexer-dashboard --sidebar
+```
+
+zellij (`~/.config/zellij/layouts/default.kdl`), to give every tab a
+sidebar, including the tabs and sessions you open later:
 
 ```kdl
 layout {
@@ -140,22 +145,8 @@ layout {
 }
 ```
 
-tmux: open a sidebar on the left of the current window:
-
-```sh
-tmux split-window -hbf -l 32 multiplexer-dashboard --sidebar
-```
-
-With `set -g focus-events on`, tmux tells the sidebar when it gets focus.
-Without it, a key press or a click in the sidebar counts as focus.
-
-Every tab runs its own sidebar, with its own cursor and filter. A sidebar
-refreshes every 2 seconds while it has focus and every 5 seconds while it is
-on screen. A sidebar in a tab that is not on screen only checks every few
-seconds whether it is shown again, so many tabs stay cheap.
-
-When zellij brings back an exited session, it waits for Enter in each pane
-before it starts the pane's command, and the sidebar's too.
+When zellij brings back an exited session, press Enter in the sidebar to
+start it again.
 
 ## Keys
 
