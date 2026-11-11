@@ -1897,12 +1897,6 @@ class App:
             waits.append(preview_due - now)
         if self.toast:
             waits.append(self.toast[2] - now)
-        if any(
-            a.status in ("working", "blocked")
-            for g in self.groups.values()
-            for a in g.agents
-        ):
-            waits.append(0.1)
         return max(0.01, min(waits))
 
     # ------------------------------------------------------------ preview
@@ -2185,8 +2179,6 @@ class App:
 
 # ---------------------------------------------------------------- view
 
-SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
 
 class View:
     """Paints the app's state as exactly rows lines of cols cells, and
@@ -2194,13 +2186,11 @@ class View:
 
     def __init__(self, app: App) -> None:
         self.app = app
-        self.frame = 0
 
     def render(self, cols: int, rows: int) -> list[str]:
         app = self.app
         app.hits = []
         app.clamp()
-        self.frame = int(time.monotonic() * 10)
         dim = 0.55 if app.mode in ("rename", "new", "kill", "help") else 0.0
         Canvas.theme = Theme(app.options.dark, dim)
         Canvas.paint_bg = app.options.paint_bg
@@ -2340,7 +2330,7 @@ class View:
         t = Canvas.theme
         name = paint(" " + r.mux + " ", t.mux(r.mux), bold=True)
         if r.note == "loading…":
-            tail = paint(f" {SPINNER[self.frame % len(SPINNER)]} loading ", t.muted)
+            tail = paint(" loading ", t.muted)
         elif r.note:
             tail = paint(f" {r.note} ", t.love)
         elif r.count == 0 and which == SESSIONS:
@@ -2387,8 +2377,7 @@ class View:
         if st == "working":
             color = t.gold
         elif st == "blocked":
-            # Pulses, since it waits for the user.
-            color = t.love if (self.frame // 6) % 2 == 0 else mix(t.love, t.base, 0.45)
+            color = t.love
         elif st == "idle":
             color = t.foam
         elif st == "done":

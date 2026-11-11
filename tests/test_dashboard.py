@@ -1079,6 +1079,16 @@ class ScreenTest(unittest.TestCase):
         text = "\n".join(plain(line) for line in app.render(120, 30))
         self.assertIn("server not running", text)
 
+    def test_agent_status_does_not_wake_the_loop_early(self):
+        app = make_app(listed=("herdr",), inside=("herdr",))
+        agent = md.Agent("herdr", "repo", "w1", "1", 1, "w1:p1", "pi")
+        app.set_group(md.Group("herdr", [md.Session("herdr", "repo")], [agent]))
+        app.next_load["herdr"] = 200.0
+        app.selection = None
+        for status in md.STATUS_ICONS:
+            agent.status = status
+            self.assertEqual(app.timeout(100.0), 0.5)
+
     def test_help(self):
         app = self.app()
         app.handle(md.Event("key", "?"))
