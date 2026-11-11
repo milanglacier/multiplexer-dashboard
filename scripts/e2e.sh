@@ -476,6 +476,181 @@ if have herdr; then
     t kill-window -t e2e:hin
 fi
 
+# ---------------------------------------------------------------- sidebar
+
+# dash_pane SESSION TAB: the dashboard's pane in a zellij session's tab, by
+# tab position.
+dash_pane() {
+    zellij --session "$1" action list-panes -a -j 2>/dev/null | jq -r --argjson t "$2" \
+        '.[] | select(.tab_position == $t and ((.pane_command // .terminal_command // "") | contains("--sidebar")) and (.exited | not)) | "terminal_\(.id)"'
+}
+
+if have zellij; then
+    step "zellij sidebar: a layout puts the dashboard in every tab"
+    # A config directory of its own. zside2 starts in the background from
+    # the default layout, and zside from tabs.kdl. A session that zside's
+    # client makes with `n` gets the layout that the client started with.
+    sidecfg="$tmp/config/zellij-sidebar"
+    mkdir -p "$sidecfg"
+    # The default layout, in the form the README gives.
+    cat >"$sidecfg/sidebar.kdl" <<EOF
+layout {
+    new_tab_template {
+        pane split_direction="vertical" {
+            pane size=30 command="$dash" close_on_exit=true {
+                args "--theme" "dark" "--sidebar"
+            }
+            pane focus=true
+        }
+    }
+}
+EOF
+    cat >"$sidecfg/tabs.kdl" <<EOF
+layout {
+    default_tab_template {
+        pane split_direction="vertical" {
+            pane size=30 command="$dash" close_on_exit=true {
+                args "--theme" "dark" "--sidebar"
+            }
+            children
+        }
+    }
+    tab name="one" focus=true {
+        pane focus=true
+    }
+    tab name="two" {
+        pane command="claude"
+    }
+}
+EOF
+    cat >"$sidecfg/config.kdl" <<EOF
+show_startup_tips false
+show_release_notes false
+default_layout "$sidecfg/sidebar.kdl"
+EOF
+    # zellij gives ages in whole seconds, and sessions created in the same
+    # second swap places between loads. A second apart, zside2 and zside
+    # keep their rows.
+    sleep 1
+    (cd "$tmp/proj/plain" && ZELLIJ_CONFIG_DIR=$sidecfg zellij attach --create-background zside2)
+    sleep 1
+    t new-window -d -t e2e -n zs \
+        "cd $tmp/proj/plain && clean env ZELLIJ_CONFIG_DIR=$sidecfg zellij --layout $sidecfg/tabs.kdl attach --create zside; echo EXIT=\$?; sleep 600"
+    w=e2e:zs
+    wait_for $w "zside2" && echo "ok: the sidebar lists the sessions"
+    check "a narrow pane has no preview" "$(screen $w | grep -c Preview)" 0
+    check "and both lists" "$(screen $w | grep -c -e '─ Sessions ─' -e '─ Agents ─')" 2
+    check "the sidebar has no header" "$(screen $w | grep -c 'multiplexer dashboard')" 0
+    side_one=$(dash_pane zside 0)
+    side_two=$(dash_pane zside 1)
+    claude_side=$(zellij --session zside action list-panes -j |
+        jq -r '.[] | select(.pane_command // "" | startswith("claude")) | "terminal_\(.id)"')
+    check "the sidebar starts without focus" "$(zclients zside | grep -c -- "^$side_one\$")" 0
+
+    step "zellij sidebar: a click on the pane without focus focuses it and selects the row"
+    row=$(row_of $w " zside2 ")
+    click $w 6 "$row"
+    eventually "the sidebar has focus" "$side_one" zclients zside
+    wait_for $w "▌   zside2" && echo "ok: the click selected the row"
+
+    step "zellij sidebar: Enter on another session moves the client and the pane stays"
+    t send-keys -t $w Enter
+    eventually "the client is in zside2" 1 sh -c 'zellij --session zside2 action list-clients | awk "NR > 1" | wc -l'
+    check "the old session's pane still runs" "$(dash_pane zside 0)" "$side_one"
+    side2=$(dash_pane zside2 0)
+    check "the default layout puts a pane next to the sidebar" \
+        "$(zellij --session zside2 action list-panes -j | jq '[.[] | select(.tab_position == 0 and (.is_plugin | not))] | length')" 2
+    # zside2's pane loaded the lists before zside existed, and then had no
+    # client to show it.
+    wait_for $w " zside " && echo "ok: the hidden pane loads again once it is shown"
+
+    step "zellij sidebar: back to zside from zside2's sidebar"
+    row=$(row_of $w " zside ")
+    click $w 6 "$row"
+    eventually "zside2's sidebar has focus" "$side2" zclients zside2
+    t send-keys -t $w Enter
+    eventually "the client is back in zside" 1 sh -c 'zellij --session zside action list-clients | awk "NR > 1" | wc -l'
+    check "zside2's pane still runs" "$(dash_pane zside2 0)" "$side2"
+
+    step "zellij sidebar: Enter on an agent in the same session focuses it"
+    row=$(row_of $w "─ Sessions ─")
+    click $w 6 $((row + 2))
+    eventually "the sidebar has focus" "$side_one" zclients zside
+    # The tab name picks the claude of zside, since zone has one too.
+    filter $w two
+    t send-keys -t $w Tab Enter
+    eventually "the client is on the claude pane" "$claude_side" zclients zside
+    check "the sidebar of the first tab still runs" "$(dash_pane zside 0)" "$side_one"
+
+    step "zellij sidebar: Escape gives focus back to the last pane"
+    # A click on the selected row: the click that gives focus does not
+    # switch.
+    row=$(row_of $w "─ Sessions ─")
+    click $w 6 $((row + 2))
+    eventually "the second tab's sidebar has focus" "$side_two" zclients zside
+    t send-keys -t $w Escape
+    eventually "focus is back on the claude pane" "$claude_side" zclients zside
+    check "the sidebar still runs" "$(dash_pane zside 1)" "$side_two"
+
+    step "zellij sidebar: q does nothing, and n makes a session with the sidebar"
+    click $w 6 $((row + 2))
+    eventually "the sidebar has focus" "$side_two" zclients zside
+    t send-keys -t $w q
+    sleep 0.5
+    check "q leaves the sidebar open" "$(dash_pane zside 1)" "$side_two"
+    t send-keys -t $w n
+    wait_for $w "New session" >/dev/null
+    t send-keys -t $w -l zfresh
+    t send-keys -t $w Enter
+    eventually "the client is in zfresh" 1 sh -c 'zellij --session zfresh action list-clients | awk "NR > 1" | wc -l'
+    zfresh_side=""
+    deadline=$((SECONDS + 15))
+    until [[ -n "$zfresh_side" ]] || ((SECONDS > deadline)); do
+        zfresh_side=$(dash_pane zfresh 0)
+        sleep 0.1
+    done
+    check "zfresh has the sidebar" "$([[ -n "$zfresh_side" ]] && echo yes)" yes
+    check "zside's sidebar still runs" "$(dash_pane zside 1)" "$side_two"
+    t kill-window -t $w
+    for s in zside zside2 zfresh; do zellij delete-session --force $s >/dev/null 2>&1; done
+else
+    skip "zellij not installed"
+fi
+
+step "tmux sidebar: a split with --sidebar"
+tm new-session -d -s side -c "$tmp/proj/plain" -x 120 -y 30
+side_shell=$(tm display -p -t side: '#{pane_id}')
+side_pane=$(tm split-window -h -b -l 30 -P -F '#{pane_id}' -t side: "$dash --theme dark --sidebar")
+t new-window -d -t e2e -n ts "clean tmux attach -t =side"
+w=e2e:ts
+wait_for $w "beta" && echo "ok: the tmux sidebar lists the sessions"
+check "a narrow pane has no preview" "$(screen $w | grep -c Preview)" 0
+check "and both lists" "$(screen $w | grep -c -e '─ Sessions ─' -e '─ Agents ─')" 2
+client=$(tm list-clients -F '#{client_name} #{session_name}' | awk '$2 == "side" { print $1 }')
+
+step "tmux sidebar: Enter switches the client and the pane stays"
+tm select-pane -t "$side_pane"
+filter $w beta
+t send-keys -t $w Enter
+eventually "the client switched to beta" beta tm display -p -c "$client" '#{session_name}'
+check "the sidebar still runs" "$(tm list-panes -t side: -F '#{pane_id}' | grep -c -- "$side_pane")" 1
+tm switch-client -c "$client" -t side
+wait_for $w "Switched to beta." && echo "ok: the sidebar says where it switched"
+
+step "tmux sidebar: Escape runs last-pane"
+tm select-pane -t "$side_shell"
+tm select-pane -t "$side_pane"
+# The first Escape clears the filter. Two Escapes in one read are
+# Alt+Escape, so the second waits for the first to land.
+wait_for $w "/beta" >/dev/null
+t send-keys -t $w Escape
+wait_gone $w "/beta" >/dev/null
+t send-keys -t $w Escape
+eventually "the shell pane is active again" "$side_shell" tm display -p -c "$client" '#{pane_id}'
+check "the sidebar still runs" "$(tm list-panes -t side: -F '#{pane_id}' | grep -c -- "$side_pane")" 1
+t kill-window -t $w
+tm kill-session -t side
+
 # ---------------------------------------------------------------- nested
 
 step "nested: zellij inside tmux lists both"

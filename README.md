@@ -109,6 +109,54 @@ width = 140
 height = 40
 ```
 
+## Keep it open in a sidebar
+
+`multiplexer-dashboard --sidebar` shows only the Sessions and Agents lists,
+so it fits a pane of about 30 columns. Inside a multiplexer it stays open:
+Enter takes you to the session or agent and the pane stays, Escape gives
+focus back to the pane you came from, `q` does nothing, and Ctrl+C quits.
+
+zellij: to give every tab of every session a sidebar, including the sessions
+that you create with `n`, add a `new_tab_template` to your default layout,
+`~/.config/zellij/layouts/default.kdl`. This one keeps the tab bar and the
+status bar:
+
+```kdl
+layout {
+    new_tab_template {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        pane split_direction="vertical" {
+            pane size=32 command="multiplexer-dashboard" close_on_exit=true {
+                args "--sidebar"
+            }
+            pane focus=true
+        }
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+}
+```
+
+tmux: open a sidebar on the left of the current window:
+
+```sh
+tmux split-window -hbf -l 32 multiplexer-dashboard --sidebar
+```
+
+With `set -g focus-events on`, tmux tells the sidebar when it gets focus.
+Without it, a key press or a click in the sidebar counts as focus.
+
+Every tab runs its own sidebar, with its own cursor and filter. A sidebar
+refreshes every 2 seconds while it has focus and every 5 seconds while it is
+on screen. A sidebar in a tab that is not on screen only checks every few
+seconds whether it is shown again, so many tabs stay cheap.
+
+When zellij brings back an exited session, it waits for Enter in each pane
+before it starts the pane's command, and the sidebar's too.
+
 ## Keys
 
 | Key             | Action                             |
@@ -131,6 +179,7 @@ to move.
 ```
 multiplexer-dashboard [--multiplexer tmux|zellij|herdr] [--client CLIENT]
                       [--dir DIR] [--theme auto|light|dark] [--no-bg]
+                      [--sidebar]
 ```
 
 - `--multiplexer` lists only one multiplexer.
@@ -141,6 +190,9 @@ multiplexer-dashboard [--multiplexer tmux|zellij|herdr] [--client CLIENT]
 - `--theme` picks Rose Pine (dark) or Rose Pine Dawn (light). By default the
   dashboard follows the terminal's background color.
 - `--no-bg` keeps the terminal's own background.
+- `--sidebar` shows only the lists, and inside a multiplexer stays open
+  after a switch. See [Keep it open in a sidebar](#keep-it-open-in-a-sidebar).
+  herdr has a sidebar of its own, and in herdr Escape does nothing.
 
 Inside a multiplexer the dashboard lists only that multiplexer, or each one
 it runs in when they are nested. herdr workspaces appear as sessions, and

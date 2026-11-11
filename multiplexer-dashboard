@@ -5,6 +5,7 @@ agents that run in them.
 Usage: multiplexer-dashboard [--multiplexer tmux|zellij|herdr]
                              [--client CLIENT] [--dir DIR]
                              [--theme auto|light|dark] [--no-bg]
+                             [--sidebar]
 
 The left column lists sessions above agents, both grouped by multiplexer in
 the order zellij, herdr, tmux. The right side previews the selected
@@ -42,6 +43,16 @@ inside herdr, where it is the directory of the current pane.
 CLIENT is the tmux client to switch inside tmux. It defaults to the client
 that tmux picks for the calling process.
 
+--sidebar shows only the two lists, without the header and the preview, for
+a narrow pane that stays next to the work, such as one in every tab of a
+zellij layout or a tmux split. Inside a multiplexer the dashboard then stays
+open after a switch, Escape gives focus back to the last pane (in zellij
+and tmux), q does nothing, and Ctrl+C quits. The lists refresh every 2 seconds while
+the pane has focus, every 5 seconds while it is on screen without focus,
+and not at all while it is hidden, such as in a tab that is not shown. A
+hidden pane asks its multiplexer every 3 seconds whether it is on screen
+again.
+
 Keys: j/k or the arrows move, g/G or Home/End jump to the ends, Alt+j/k or
 Alt+arrows jump between multiplexers, Tab switches lists, Enter switches,
 / filters, n creates, r renames, x kills, Ctrl+L refreshes, ? shows every
@@ -63,6 +74,7 @@ import signal
 import subprocess
 import sys
 import termios
+import textwrap
 import threading
 import time
 import tty
@@ -75,15 +87,21 @@ MULTIPLEXERS = ("zellij", "herdr", "tmux")
 SCRIPT = os.path.abspath(__file__)
 SESSIONS, AGENTS = 0, 1
 REFRESH_SECONDS = 2.0
+# In --sidebar mode: the refresh while the pane is on screen without focus,
+# and how often a pane without focus checks whether it is on screen.
+UNFOCUSED_REFRESH_SECONDS = 5.0
+VISIBILITY_CHECK_SECONDS = 3.0
 PREVIEW_DELAY = 0.1
 MIN_COLS, MIN_ROWS, PREVIEW_MIN_COLS = 40, 12, 72
+SIDEBAR_MIN_COLS, SIDEBAR_MIN_ROWS = 24, 10
 
 # ---------------------------------------------------------------- terminal
 
 
 class Event(NamedTuple):
-    """A key press, named as "j", "enter" or "alt+up", or a mouse press at a
-    0-based cell."""
+    """A key press, named as "j", "enter" or "alt+up", a mouse press or
+    release at a 0-based cell, or the terminal gaining ("in") or losing
+    ("out") focus."""
 
     kind: str
     key: str = ""
@@ -137,6 +155,8 @@ KEY_NAMES = {
     "\x10": "up",
 }
 ARROWS = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end"}
+# Focus reports, sent while focus reporting (mode 1004) is on.
+FOCUS_SEQS = {"\x1b[I": "in", "\x1b[O": "out"}
 
 
 def key_name(seq: str) -> str:
@@ -156,19 +176,17 @@ def key_name(seq: str) -> str:
 
 
 def parse_input(data: str) -> list[Event]:
-    """Turns the text of one read from the terminal into events. Mouse
-    releases and replies to terminal queries are dropped."""
+    """Turns the text of one read from the terminal into events. Replies to
+    terminal queries are dropped."""
     events: list[Event] = []
     i = 0
     while i < len(data):
         m = MOUSE_RE.match(data, i)
         if m:
-            if m[4] == "M":
-                # Drop the shift, alt and ctrl bits.
-                button = int(m[1]) & ~0b11100
-                events.append(
-                    Event("mouse", button=button, x=int(m[2]) - 1, y=int(m[3]) - 1)
-                )
+            # Drop the shift, alt and ctrl bits.
+            button = int(m[1]) & ~0b11100
+            kind = "mouse" if m[4] == "M" else "release"
+            events.append(Event(kind, button=button, x=int(m[2]) - 1, y=int(m[3]) - 1))
             i = m.end()
             continue
         m = OSC_RE.match(data, i)
@@ -178,7 +196,10 @@ def parse_input(data: str) -> list[Event]:
         m = KEY_SEQ_RE.match(data, i)
         seq = m.group() if m else data[i]
         i = m.end() if m else i + 1
-        events.append(Event("key", key_name(seq)))
+        if seq in FOCUS_SEQS:
+            events.append(Event("focus", FOCUS_SEQS[seq]))
+        else:
+            events.append(Event("key", key_name(seq)))
     return events
 
 
@@ -192,13 +213,15 @@ def luminance_is_dark(reply: bytes) -> bool | None:
 
 
 class Term:
-    """Raw mode, the alternate screen, mouse reporting and a renderer that
-    rewrites only the lines that changed, all on /dev/tty."""
+    """Raw mode, the alternate screen, mouse reporting, focus reporting when
+    asked for, and a renderer that rewrites only the lines that changed, all
+    on /dev/tty."""
 
-    def __init__(self, wake_fd: int) -> None:
+    def __init__(self, wake_fd: int, focus_events: bool = False) -> None:
         self.fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
         self.saved = termios.tcgetattr(self.fd)
         self.wake_fd = wake_fd
+        self.focus_events = focus_events
         self.prev: list[str] = []
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.resized = False
@@ -211,14 +234,18 @@ class Term:
 
     def __enter__(self) -> None:
         tty.setraw(self.fd)
-        # Alternate screen, hidden cursor, button and wheel mouse in SGR form.
+        # Alternate screen, hidden cursor, button and wheel mouse in SGR form,
+        # and focus reports.
         self.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
+        if self.focus_events:
+            self.write("\x1b[?1004h")
 
     def __exit__(self, *exc: object) -> None:
         # Each step is tried even when an earlier one fails, such as when
         # the terminal has gone away.
         try:
-            self.write("\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l")
+            focus = "\x1b[?1004l" if self.focus_events else ""
+            self.write(focus + "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l")
         except OSError:
             pass
         try:
@@ -500,6 +527,23 @@ def gradient(text: str, c1: RGB, c2: RGB, fg: RGB) -> str:
     return "".join(
         paint(ch, fg, mix(c1, c2, i / n), bold=True) for i, ch in enumerate(text)
     )
+
+
+def flow(pieces: Sequence[str], w: int, sep: str = "") -> list[str]:
+    """Painted pieces on lines of at most w cells, joined by sep. A piece
+    that does not fit starts a new line, and a piece wider than w gets a
+    line of its own."""
+    lines: list[str] = []
+    line = ""
+    for p in pieces:
+        if line and width(line) + width(sep) + width(p) > w:
+            lines.append(line)
+            line = p
+        else:
+            line = line + sep + p if line else p
+    if line:
+        lines.append(line)
+    return lines
 
 
 def plural(n: int, unit: str) -> str:
@@ -984,8 +1028,20 @@ def tmux_snapshot(
     return Group("tmux", sessions, agents)
 
 
+def parse_tmux_visible(text: str) -> bool | None:
+    """Whether a pane is on screen, from `display-message -p -t PANE
+    '#{window_active} #{session_attached}'`: its window is the session's
+    active one and a client shows the session. None when the reply holds no
+    answer."""
+    f = text.split()
+    if len(f) != 2:
+        return None
+    return f[0] != "0" and f[1] != "0"
+
+
 class Tmux:
     name = "tmux"
+    checks_visibility = True
 
     def __init__(
         self, runner: Runner, env: Mapping[str, str], client: str | None = None
@@ -1064,6 +1120,30 @@ class Tmux:
 
     def default_dir(self, inside: bool) -> str | None:
         return None
+
+    def back(self) -> list[str] | None:
+        """The command that gives focus back to the last pane of the
+        dashboard's own window."""
+        pane = self.env.get("TMUX_PANE")
+        return ["tmux", "last-pane"] + (["-t", pane] if pane else [])
+
+    def visible(self) -> bool | None:
+        """Whether the dashboard's own pane is on screen, or None when tmux
+        does not say."""
+        pane = self.env.get("TMUX_PANE")
+        if not pane:
+            return None
+        r = self.run(
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{window_active} #{session_attached}",
+            ]
+        )
+        return parse_tmux_visible(r.out) if r.code == 0 else None
 
 
 # ---------------------------------------------------------------- zellij
@@ -1184,6 +1264,29 @@ def parse_zellij_panes(
     return agents
 
 
+def zellij_pane_tabs(panes_json: str) -> dict[str, str]:
+    """The tab id of each pane, named as list-clients names it, such as
+    "terminal_3" or "plugin_1", from `action list-panes -a -j`."""
+    tabs = {}
+    for p in json.loads(panes_json):
+        kind = "plugin" if p.get("is_plugin") else "terminal"
+        tabs[f"{kind}_{p['id']}"] = str(p.get("tab_id", ""))
+    return tabs
+
+
+def zellij_pane_visible(
+    clients: Sequence[tuple[str, str]], pane_tabs: Mapping[str, str], own_pane: str
+) -> bool:
+    """Whether a client shows the tab of the dashboard's own pane: one of the
+    clients' focused panes is in that tab. A pane missing from pane_tabs,
+    which was made after the map, counts as in the tab, so that the next
+    full load brings the map up to date."""
+    own_tab = pane_tabs.get(own_pane)
+    if own_tab is None:
+        return True
+    return any(pane_tabs.get(pane, own_tab) == own_tab for _, pane in clients)
+
+
 def parse_zellij_clients(text: str) -> list[tuple[str, str]]:
     """Client ids and their focused panes from `action list-clients`."""
     clients = []
@@ -1224,6 +1327,7 @@ def zellij_focus_pane(
 
 class Zellij:
     name = "zellij"
+    checks_visibility = True
 
     def __init__(
         self, runner: Runner, env: Mapping[str, str], client: str | None = None
@@ -1231,6 +1335,9 @@ class Zellij:
         self.run = runner
         self.env = env
         self.names = agent_names(env)
+        self.own_pane = f"terminal_{env.get('ZELLIJ_PANE_ID')}"
+        # The tab of each pane of the current session, from the last load.
+        self.pane_tabs: dict[str, str] = {}
 
     def load(self, inside: bool) -> Group:
         r = self.run(["zellij", "list-sessions", "--no-formatting"])
@@ -1240,7 +1347,7 @@ class Zellij:
             return Group("zellij", error=error_text(r))
         sessions = parse_zellij_sessions(r.out, time.time())
         current = self.env.get("ZELLIJ_SESSION_NAME") if inside else None
-        own = f"terminal_{self.env.get('ZELLIJ_PANE_ID')}" if inside else ""
+        own = self.own_pane if inside else ""
         for s in sessions:
             s.current = (s.current and inside) or s.name == current
         running = [s for s in sessions if not s.exited]
@@ -1263,6 +1370,8 @@ class Zellij:
                 agents += parse_zellij_panes(
                     s, panes.out, tabs_json, self.names, own_pane
                 )
+                if own_pane:
+                    self.pane_tabs = zellij_pane_tabs(panes.out)
             except (ValueError, KeyError, TypeError):
                 continue
         return Group("zellij", sessions, agents)
@@ -1321,6 +1430,20 @@ class Zellij:
 
     def default_dir(self, inside: bool) -> str | None:
         return None
+
+    def back(self) -> list[str] | None:
+        """The command that gives focus back to the last focused pane."""
+        return ["zellij", "action", "focus-last-pane"]
+
+    def visible(self) -> bool | None:
+        """Whether a client of the current session shows the tab of the
+        dashboard's own pane, or None when zellij does not say."""
+        r = self.run(["zellij", "action", "list-clients"])
+        if r.code != 0:
+            return None
+        return zellij_pane_visible(
+            parse_zellij_clients(r.out), self.pane_tabs, self.own_pane
+        )
 
 
 # ---------------------------------------------------------------- herdr
@@ -1398,6 +1521,7 @@ def parse_herdr(
 
 class Herdr:
     name = "herdr"
+    checks_visibility = False
 
     def __init__(
         self, runner: Runner, env: Mapping[str, str], client: str | None = None
@@ -1510,6 +1634,15 @@ class Herdr:
         except ValueError:
             return None
         return pane.get("foreground_cwd") or pane.get("cwd") or None
+
+    def back(self) -> list[str] | None:
+        """None: herdr's CLI has no command that focuses the last pane."""
+        return None
+
+    def visible(self) -> bool | None:
+        """None: the dashboard does not ask herdr, and its pane counts as on
+        screen."""
+        return None
 
 
 BACKENDS = {"tmux": Tmux, "zellij": Zellij, "herdr": Herdr}
@@ -1740,6 +1873,9 @@ class Options:
     directory: str | None = None
     dark: bool = True
     paint_bg: bool = True
+    # Show only the lists, and inside a multiplexer stay open after a
+    # switch.
+    sidebar: bool = False
 
 
 class App:
@@ -1782,12 +1918,40 @@ class App:
         self.result: Exit | None = None
         self.redraw_all = False
         self.loading: dict[str, bool] = {m: False for m in ctx.listed}
-        self.next_load: dict[str, float] = {m: 0.0 for m in ctx.listed}
+        self.loaded_at: dict[str, float] = {m: float("-inf") for m in ctx.listed}
         self.generation: dict[str, int] = {m: 0 for m in ctx.listed}
         self.previews: dict[tuple[str, ...], Preview] = {}
         self.capturing: set[tuple[str, ...]] = set()
         self.selection: tuple[str, ...] | None = None
         self.selection_since = 0.0
+        # In a sidebar inside a multiplexer, the dashboard stays open after
+        # a switch, and Escape runs the back command of the first
+        # multiplexer it runs in, in the order zellij, herdr, tmux, that has
+        # one.
+        self.stays_open = options.sidebar and bool(ctx.inside)
+        enclosing = [
+            self.backends[m]
+            for m in MULTIPLEXERS
+            if m in self.backends and m in ctx.inside
+        ]
+        self.back_command = next(
+            (cmd for cmd in (b.back() for b in enclosing) if cmd), None
+        )
+        # Whether the pane has focus and whether it is on screen. A focus
+        # report, a key press or a mouse press gives it focus. The terminal
+        # sends focus reports only in sidebar mode, so focus_reported stays
+        # False elsewhere and in terminals that never send them.
+        self.focused = False
+        self.focus_reported = False
+        # Whether focus came in after the last key or mouse press. The click
+        # that gives a pane focus only selects a row, even the selected one.
+        self.just_focused = False
+        self.visible = True
+        self.checks = (
+            [b for b in enclosing if b.checks_visibility] if self.stays_open else []
+        )
+        self.checking = False
+        self.next_check = 0.0
         self.view = View(self)
 
     # ------------------------------------------------------------ queries
@@ -1834,10 +1998,21 @@ class App:
         for mux in self.ctx.listed:
             self.start_load(mux)
 
+    def start_check(self) -> None:
+        """Asks on another thread whether the pane is on screen: it is when
+        no multiplexer it runs in says otherwise."""
+        if self.checking or self.inbox is None:
+            return
+        self.checking = True
+        checks = self.checks
+        self.inbox.spawn(
+            "visible", None, lambda: all(b.visible() is not False for b in checks)
+        )
+
     def receive(self, kind: str, key: Any, value: Any, now: float) -> None:
         if kind == "load":
             self.loading[key] = False
-            self.next_load[key] = now + REFRESH_SECONDS
+            self.loaded_at[key] = now
             group = (
                 value
                 if isinstance(value, Group)
@@ -1853,6 +2028,16 @@ class App:
                 self.previews[key] = Preview(generation, [], error_text(result))
             else:
                 self.previews[key] = Preview(generation, sanitize_capture(result.out))
+        elif kind == "visible":
+            self.checking = False
+            self.next_check = now + VISIBILITY_CHECK_SECONDS
+            was, self.visible = self.visible, value is not False
+            if not self.visible:
+                # A hidden pane has no focus, also in a terminal that sends
+                # no focus reports.
+                self.focused = False
+            elif not was:
+                self.refresh()
 
     def set_group(self, group: Group) -> None:
         """Replaces a multiplexer's data and keeps each cursor on the same
@@ -1873,12 +2058,36 @@ class App:
 
     # ------------------------------------------------------------ timing
 
+    def refresh_period(self) -> float | None:
+        """The time between full loads: 2 seconds, and in sidebar mode 5
+        seconds while the pane is on screen without focus and none while
+        it is hidden."""
+        if not self.options.sidebar or self.focused:
+            return REFRESH_SECONDS
+        return UNFOCUSED_REFRESH_SECONDS if self.visible else None
+
+    def next_load(self, mux: str) -> float | None:
+        """When the next full load of a multiplexer is due, or None."""
+        period = self.refresh_period()
+        return None if period is None else self.loaded_at[mux] + period
+
+    def wants_check(self) -> bool:
+        """Whether the visibility checks run: while the pane has no focus,
+        and always in a terminal that sends no focus reports, where only
+        a check can take the focus away."""
+        return bool(self.checks) and not (self.focused and self.focus_reported)
+
     def tick(self, now: float) -> None:
         for mux in self.ctx.listed:
-            if not self.loading[mux] and now >= self.next_load[mux]:
+            due = self.next_load(mux)
+            if not self.loading[mux] and due is not None and now >= due:
                 self.start_load(mux)
+        if self.wants_check() and now >= self.next_check:
+            self.start_check()
         if self.toast and now > self.toast[2]:
             self.toast = None
+        if self.options.sidebar:
+            return
         row = self.selected()
         key = item_key(row) if row else None
         if key != self.selection:
@@ -1887,17 +2096,28 @@ class App:
             self.maybe_capture(row, key)
 
     def timeout(self, now: float) -> float:
-        """How long the main loop may wait for input."""
-        waits = [0.5]
-        waits += [
-            self.next_load[m] - now for m in self.ctx.listed if not self.loading[m]
-        ]
+        """How long the main loop may wait for input. Input, resizes and
+        loaded data wake it at once, so the bound of 0.5 seconds only keeps
+        it lively. In sidebar mode the bound applies only while the pane
+        has focus, so that a pane without focus wakes only for its next
+        load or visibility check."""
+        waits = []
+        if not self.options.sidebar or self.focused:
+            waits.append(0.5)
+        for m in self.ctx.listed:
+            due = self.next_load(m)
+            if not self.loading[m] and due is not None:
+                waits.append(due - now)
+        if self.wants_check() and not self.checking:
+            waits.append(self.next_check - now)
         preview_due = self.selection_since + PREVIEW_DELAY
         if self.selection and now < preview_due:
             waits.append(preview_due - now)
         if self.toast:
             waits.append(self.toast[2] - now)
-        return max(0.01, min(waits))
+        # With nothing due, as in a hidden pane while its check runs, only
+        # input or another thread's result wakes the loop.
+        return max(0.01, min(waits, default=60.0))
 
     # ------------------------------------------------------------ preview
 
@@ -1946,20 +2166,41 @@ class App:
                 return False
         return True
 
-    def execute(self, plan: Plan) -> None:
+    def execute(self, plan: Plan, done: str) -> None:
         """Runs a plan's steps. On success the dashboard exits, or hands over
-        to the attaching client."""
-        if self.run_steps(plan):
+        to the attaching client. A sidebar inside a multiplexer stays open
+        instead: it says what it did (done) and loads the lists again."""
+        if not self.run_steps(plan):
+            return
+        if self.stays_open and not plan.attach:
+            # Focus has moved to another pane or session.
+            self.focused = False
+            self.say(done)
+            self.refresh()
+        else:
             self.result = Exit(0, plan if plan.attach else None)
+
+    def back(self) -> None:
+        """Leaves the current session as it is: a sidebar gives focus back
+        to the last pane, and the dashboard elsewhere closes."""
+        if not self.stays_open:
+            self.result = Exit(0)
+        elif self.back_command:
+            r = self.runner(self.back_command)
+            if r.code != 0:
+                self.say(error_text(r), warn=True)
+            else:
+                self.focused = False
 
     def switch(self, row: Row) -> None:
         mux, inside = row.mux, self.inside(row.mux)
         backend = self.backends[mux]
         if row.session:
             if row.session.current and inside:
-                self.result = Exit(0)
+                self.back()
                 return
-            self.execute(backend.switch_session(row.session, inside))
+            done = f"Switched to {row.session.name}."
+            self.execute(backend.switch_session(row.session, inside), done)
         elif row.agent:
             current = self.current_session(mux)
             plan = backend.switch_agent(
@@ -1973,7 +2214,7 @@ class App:
                 and backend.has_clients(row.agent.session)
             ):
                 plan.helper = None
-            self.execute(plan)
+            self.execute(plan, f"Switched to {row.agent.name} in {row.agent.session}.")
 
     def new_session_dir(self, mux: str) -> tuple[str, str]:
         """The directory and automatic name of a new session in mux."""
@@ -2009,11 +2250,13 @@ class App:
         existing = next((s for s in group.sessions if s.name == name), None)
         if existing:
             if existing.current and inside:
-                self.result = Exit(0)
+                self.back()
                 return
-            self.execute(backend.switch_session(existing, inside))
+            self.execute(
+                backend.switch_session(existing, inside), f"Switched to {name}."
+            )
         else:
-            self.execute(backend.create(name, directory, inside))
+            self.execute(backend.create(name, directory, inside), f"Created {name}.")
 
     def rename(self, s: Session, typed: str) -> None:
         new = sanitize_name(typed.strip())
@@ -2038,8 +2281,26 @@ class App:
     # ------------------------------------------------------------ input
 
     def handle(self, ev: Event) -> None:
+        if ev.kind == "focus":
+            self.focus_reported = True
+            self.focused = self.just_focused = ev.key == "in"
+            if self.focused:
+                self.visible = True
+                self.refresh()
+            return
+        if ev.kind == "release":
+            # zellij keeps the press that gives a pane focus and sends only
+            # the release, so a release right after focus comes in counts
+            # as the click. Every other release is ignored.
+            if not self.just_focused:
+                return
+            ev = ev._replace(kind="mouse")
+        # A key or a mouse press means the user is in the pane, also in a
+        # terminal that sends no focus reports.
+        self.focused = self.visible = True
         before = list(self.cursor)
         self.dispatch(ev)
+        self.just_focused = False
         for w in (SESSIONS, AGENTS):
             self.touched[w] = self.touched[w] or self.cursor[w] != before[w]
 
@@ -2093,8 +2354,8 @@ class App:
         elif k in ("q", "esc"):
             if k == "esc" and self.filter:
                 self.filter = ""
-            else:
-                self.result = Exit(0)
+            elif k == "esc" or not self.stays_open:
+                self.back()
 
     def session_dialog(self, k: str) -> None:
         row = self.selected()
@@ -2167,7 +2428,11 @@ class App:
         if button == 0:
             for h in self.hits:
                 if h.index >= 0 and h.y0 == y and h.x0 <= x < h.x1:
-                    again = self.focus == h.which and self.cursor[h.which] == h.index
+                    again = (
+                        self.focus == h.which
+                        and self.cursor[h.which] == h.index
+                        and not self.just_focused
+                    )
                     self.focus, self.cursor[h.which] = h.which, h.index
                     if again:
                         self.list_key("enter")
@@ -2195,30 +2460,41 @@ class View:
         Canvas.theme = Theme(app.options.dark, dim)
         Canvas.paint_bg = app.options.paint_bg
         t = Canvas.theme
-        if cols < MIN_COLS or rows < MIN_ROWS:
-            text = f"Make the window at least {MIN_COLS}×{MIN_ROWS}."
-            msg = paint(" " * max(0, (cols - len(text)) // 2) + text, t.subtle)
+        sidebar = app.options.sidebar
+        min_cols, min_rows = (
+            (SIDEBAR_MIN_COLS, SIDEBAR_MIN_ROWS) if sidebar else (MIN_COLS, MIN_ROWS)
+        )
+        if cols < min_cols or rows < min_rows:
+            text = f"Make the window at least {min_cols}×{min_rows}."
+            msg = [
+                paint(" " * max(0, (cols - len(line)) // 2) + line, t.subtle)
+                for line in textwrap.wrap(text, max(1, cols))[:rows]
+            ]
             blank = fit("", cols)
-            top = (rows - 1) // 2
-            return [blank] * top + [fit(msg, cols)] + [blank] * (rows - top - 1)
+            top = (rows - len(msg)) // 2
+            body = [fit(line, cols) for line in msg]
+            return [blank] * top + body + [blank] * (rows - top - len(msg))
 
-        h = rows - 2
-        wide = cols >= PREVIEW_MIN_COLS
+        # A sidebar has no header and no preview.
+        top = 0 if sidebar else 1
+        h = rows - 1 - top
+        wide = cols >= PREVIEW_MIN_COLS and not sidebar
         lw = max(34, min(46, cols * 2 // 5)) if wide else cols
         sh = max(4, (h * 11 + 19) // 20)
-        body = self.list_panel(SESSIONS, "Sessions", 0, 1, lw, sh)
-        body += self.list_panel(AGENTS, "Agents", 0, 1 + sh, lw, h - sh)
+        body = self.list_panel(SESSIONS, "Sessions", 0, top, lw, sh)
+        body += self.list_panel(AGENTS, "Agents", 0, top + sh, lw, h - sh)
         if wide:
             body = [
                 left + right for left, right in zip(body, self.preview(cols - lw, h))
             ]
-        lines = [self.header(cols)] + body + [self.footer(cols)]
+        header = [] if sidebar else [self.header(cols)]
+        lines = header + body + [self.footer(cols)]
 
         if dim:
             Canvas.theme = Theme(app.options.dark)
             dialog = self.dialog(cols)
             x0 = max(0, (cols - width(dialog[0])) // 2)
-            y0 = max(1, (rows - len(dialog)) // 2 - 1)
+            y0 = max(top, (rows - len(dialog)) // 2 - 1)
             for i, d in enumerate(dialog):
                 if y0 + i < rows:
                     lines[y0 + i] = overlay(lines[y0 + i], x0, d)
@@ -2402,12 +2678,15 @@ class View:
             + name
             + pen(" ")
             + pen(a.session, t.text)
-            + pen(" › " + a.tab, t.muted)
         )
-        # The status keeps its word when the row has room for it.
+        tab = pen(" › " + a.tab, t.muted)
+        # The status keeps its word when the row has room for it, and the
+        # tab goes before the session is cut.
         status = self.status(a, pen, True)
-        if width(left) + width(status) >= w:
+        if width(left) + width(tab) + width(status) >= w:
             status = self.status(a, pen, False)
+        if width(left) + width(tab) + width(status) <= w:
+            left += tab
         return lr(left, status, w, pen)
 
     def preview(self, w: int, h: int) -> list[str]:
@@ -2501,16 +2780,24 @@ class View:
             else:
                 icon = paint(" → ", t.base, t.pine, bold=True)
             return fit(icon + paint(" " + text, t.love if warn else t.text), cols)
-        keys = [
-            ("↵", "switch"),
+        actions = [
             ("⇥", "lists"),
             ("/", "filter"),
             ("n", "new"),
             ("r", "rename"),
             ("x", "kill"),
-            ("?", "help"),
-            ("q", "quit"),
         ]
+        help_and_out = [("?", "help")]
+        if not app.stays_open:
+            help_and_out.append(("q", "quit"))
+        elif app.back_command:
+            help_and_out.append(("esc", "back"))
+        # A narrow sidebar shows only the first keys, so there help and the
+        # way out come right after switch, and the help shows the rest.
+        if app.options.sidebar:
+            keys = [("↵", "switch")] + help_and_out + actions
+        else:
+            keys = [("↵", "switch")] + actions + help_and_out
         right = paint(f"/{app.filter} ", t.gold, bold=True) if app.filter else ""
         left = ""
         for k, v in keys:
@@ -2527,7 +2814,8 @@ class View:
     def dialog(self, cols: int) -> list[str]:
         app, t = self.app, Canvas.theme
         pen = Pen(t.surface)
-        dw = min(64, cols - 4)
+        # A dialog in a narrow sidebar takes all but one cell on each side.
+        dw = min(64, cols - (2 if app.options.sidebar else 4))
         iw = dw - 4
         caret = paint(" ", bg=t.iris)
 
@@ -2537,6 +2825,9 @@ class View:
                 + paint(f" {k} ", fg, bg, bold=True)
                 + pen(f" {label} ", t.subtle)
             )
+
+        def words(text: str, fg: RGB, **kw: Any) -> list[str]:
+            return [pen(word, fg, **kw) for word in text.split()]
 
         def text_field(value: str) -> str:
             v = value[-max(1, iw - 4) :]
@@ -2559,7 +2850,7 @@ class View:
                 "",
                 text_field(app.input),
                 "",
-                key("enter", "rename") + key("esc", "cancel"),
+                *flow([key("enter", "rename"), key("esc", "cancel")], iw),
             ]
         elif app.mode == "new":
             mux = app.new_mux
@@ -2574,35 +2865,33 @@ class View:
                 text_field(app.input),
                 pen(f"empty: {automatic}", t.muted, italic=True),
                 "",
-                key("enter", "create") + key("esc", "cancel"),
             ]
+            keys = [key("enter", "create"), key("esc", "cancel")]
             if len(app.ctx.listed) > 1:
-                lines[-1] += key("tab", "multiplexer")
+                keys.append(key("tab", "multiplexer"))
+            lines += flow(keys, iw)
         elif app.mode == "kill" and target:
             accent = t.love
             verb = "Delete" if target.exited else "Kill"
             title = f"{verb} session"
             agents = app.agents_of(target)
-            lines = [
-                "",
-                pen(f"{verb} ", t.text)
-                + pen(target.mux, t.mux(target.mux), bold=True)
-                + pen(" session ", t.text)
-                + pen(target.name, t.text, bold=True)
-                + pen("?", t.text),
-            ]
+            question = (
+                [pen(verb, t.text), pen(target.mux, t.mux(target.mux), bold=True)]
+                + words("session", t.text)
+                + [pen(target.name, t.text, bold=True) + pen("?", t.text)]
+            )
+            lines = ["", *flow(question, iw, pen(" "))]
             if agents:
                 names = ", ".join(a.name for a in agents)
                 stop = "stops" if len(agents) == 1 else "stop"
-                lines.append(
-                    pen(
-                        f"Its {plural(len(agents), 'agent')} ({names}) {stop} with it.",
-                        t.love,
-                    )
-                )
+                text = f"Its {plural(len(agents), 'agent')} ({names}) {stop} with it."
+                lines += flow(words(text, t.love), iw, pen(" "))
             if target.current:
-                lines.append(pen("This is the session you are in.", t.love))
-            lines += ["", key("y", verb.lower(), t.love, t.base) + key("n", "cancel")]
+                lines += flow(
+                    words("This is the session you are in.", t.love), iw, pen(" ")
+                )
+            keys = [key("y", verb.lower(), t.love, t.base), key("n", "cancel")]
+            lines += ["", *flow(keys, iw)]
         else:
             title = "Keys"
             rows = [
@@ -2617,11 +2906,19 @@ class View:
                 ("x", "kill session"),
                 ("ctrl+l", "refresh and redraw"),
                 ("mouse", "click selects, again switches"),
-                ("q Esc", "close"),
             ]
-            lines = [""] + [
-                pen(f"{k:<9}", t.iris, bold=True) + pen(v, t.text) for k, v in rows
-            ]
+            if not app.stays_open:
+                rows.append(("q Esc", "close"))
+            else:
+                if app.back_command:
+                    rows.append(("Esc", "back to the last pane"))
+                rows.append(("ctrl+c", "quit"))
+            lines = [""]
+            for k, v in rows:
+                # A description too long for the dialog goes on under itself.
+                text = textwrap.wrap(v, max(1, iw - 9))
+                lines.append(pen(f"{k:<9}", t.iris, bold=True) + pen(text[0], t.text))
+                lines += [pen(" " * 9 + more, t.text) for more in text[1:]]
             lines += ["", pen("any key closes this", t.muted, italic=True)]
 
         def border(s: str) -> str:
@@ -2655,6 +2952,11 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     p.add_argument("--theme", choices=["auto", "light", "dark"], default="auto")
     p.add_argument(
         "--no-bg", action="store_true", help="keep the terminal's own background"
+    )
+    p.add_argument(
+        "--sidebar",
+        action="store_true",
+        help="show only the lists; inside a multiplexer, stay open after a switch",
     )
     # Internal: see zellij_focus_pane.
     p.add_argument("--zellij-focus-pane", nargs=3, help=argparse.SUPPRESS)
@@ -2692,7 +2994,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     inbox = Inbox()
     try:
-        term = Term(inbox.read_fd)
+        term = Term(inbox.read_fd, focus_events=args.sidebar)
     except OSError as e:
         print(
             f"multiplexer-dashboard: cannot open the terminal: {e.strerror}",
@@ -2715,7 +3017,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dark = {"light": False, "dark": True}.get(args.theme)
             if dark is None:
                 dark = term.background_is_dark() is not False
-            options = Options(args.client, args.dir, dark, not args.no_bg)
+            options = Options(args.client, args.dir, dark, not args.no_bg, args.sidebar)
             app = App(ctx, options, run_command, os.environ, inbox)
             run_app(app, term, inbox)
     except KeyboardInterrupt:

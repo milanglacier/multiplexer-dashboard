@@ -915,6 +915,7 @@ class InputTest(unittest.TestCase):
             events,
             [
                 md.Event("mouse", button=0, x=9, y=4),
+                md.Event("release", button=0, x=9, y=4),
                 md.Event("mouse", button=65, x=2, y=3),
                 md.Event("key", "j"),
             ],
@@ -1083,7 +1084,7 @@ class ScreenTest(unittest.TestCase):
         app = make_app(listed=("herdr",), inside=("herdr",))
         agent = md.Agent("herdr", "repo", "w1", "1", 1, "w1:p1", "pi")
         app.set_group(md.Group("herdr", [md.Session("herdr", "repo")], [agent]))
-        app.next_load["herdr"] = 200.0
+        app.loaded_at["herdr"] = 198.0
         app.selection = None
         for status in md.STATUS_ICONS:
             agent.status = status
@@ -1096,6 +1097,428 @@ class ScreenTest(unittest.TestCase):
         self.assertIn("next / previous multiplexer", text)
         app.handle(md.Event("key", "x"))
         self.assertIsNone(app.mode)
+
+
+# ---------------------------------------------------------------- sidebar
+
+
+class FakeInbox:
+    """Records the work that the app starts on other threads."""
+
+    def __init__(self):
+        self.spawned = []
+
+    def spawn(self, kind, key, work):
+        self.spawned.append((kind, key, work))
+
+    def kinds(self):
+        kinds = [(kind, key) for kind, key, _ in self.spawned]
+        self.spawned = []
+        return kinds
+
+
+ZELLIJ_ENV = {
+    "HOME": "/home/me",
+    "ZELLIJ_SESSION_NAME": "dotfiles",
+    "ZELLIJ_PANE_ID": "9",
+}
+TMUX_ENV = {"HOME": "/home/me", "TMUX_PANE": "%3"}
+
+
+class SidebarTest(unittest.TestCase):
+    def app(self, listed=("zellij",), inside=("zellij",), env=None, answers=None):
+        runner = FakeRunner(answers)
+        app = md.App(
+            md.Context(list(listed), set(inside)),
+            md.Options(sidebar=True),
+            runner,
+            env if env is not None else dict(ZELLIJ_ENV),
+            FakeInbox(),
+        )
+        for g in groups():
+            if g.mux in listed:
+                app.set_group(g)
+        return app, runner
+
+    def keys(self, app, *ks):
+        for k in ks:
+            app.handle(md.Event("key", k))
+
+    # ------------------------------------------------------------ input
+
+    def test_focus_reports(self):
+        self.assertEqual(
+            md.parse_input("\x1b[Ij\x1b[O\x1b[A\x1b"),
+            [
+                md.Event("focus", "in"),
+                md.Event("key", "j"),
+                md.Event("focus", "out"),
+                md.Event("key", "up"),
+                md.Event("key", "esc"),
+            ],
+        )
+
+    # ------------------------------------------------------------ screen
+
+    def test_lists_only_at_any_width(self):
+        app, _ = self.app()
+        lines = [plain(line) for line in app.render(160, 30)]
+        self.assertNotIn("Preview", "\n".join(lines))
+        self.assertNotIn("multiplexer dashboard", "\n".join(lines))
+        # The lists start on the first row and take the full width.
+        self.assertTrue(lines[0].startswith("╭─ Sessions "))
+        self.assertTrue(lines[0].endswith("╮"))
+        self.assertEqual(app.inbox.kinds(), [])
+        app.tick(100.0)
+        app.tick(101.0)
+        self.assertNotIn("preview", [kind for kind, _ in app.inbox.kinds()])
+
+    def test_minimum_size(self):
+        app, _ = self.app()
+        for cols, rows in [(24, 10), (30, 40)]:
+            lines = app.render(cols, rows)
+            self.assertEqual(len(lines), rows)
+            self.assertEqual({md.width(line) for line in lines}, {cols})
+            self.assertIn("Sessions", plain(lines[0]))
+        for cols, rows in [(23, 10), (24, 9), (10, 3)]:
+            lines = app.render(cols, rows)
+            self.assertEqual(len(lines), rows)
+            self.assertEqual({md.width(line) for line in lines}, {cols})
+            text = " ".join(
+                plain(line).strip() for line in lines if plain(line).strip()
+            )
+            self.assertTrue(
+                "Make the window at least 24×10.".startswith(text), (cols, rows, text)
+            )
+        lines = [plain(line) for line in app.render(23, 10)]
+        self.assertIn(
+            "Make the window at least 24×10.", " ".join(line.strip() for line in lines)
+        )
+
+    def test_footer_and_help(self):
+        app, _ = self.app()
+        footer = plain(app.render(60, 20)[-1])
+        self.assertIn("esc  back", footer)
+        self.assertNotIn("quit", footer)
+        # The help comes second, so that a narrow pane shows it.
+        self.assertIn("?  help", plain(app.render(30, 20)[-1]))
+        self.keys(app, "?")
+        text = "\n".join(plain(line) for line in app.render(30, 30))
+        self.assertIn("Esc      back to the", text)
+        self.assertIn("         last pane", text)
+        self.assertIn("ctrl+c   quit", text)
+
+    def test_narrow_agent_row_drops_the_tab_first(self):
+        app, _ = self.app()
+        for a in app.groups["zellij"].agents:
+            a.session = "dotfiles-long"
+        # With room for the session and the tab, both are shown.
+        text = "\n".join(plain(line) for line in app.render(33, 30))
+        self.assertIn("✻ claude dotfiles-long › main", text)
+        text = "\n".join(plain(line) for line in app.render(30, 30))
+        self.assertIn("✻ claude dotfiles-long ", text)
+        self.assertNotIn("› main", text)
+        # The session is cut only when the row has no room for it.
+        text = "\n".join(plain(line) for line in app.render(24, 30))
+        self.assertIn("✻ claude dotfiles-l…", text)
+
+    def test_dialogs_fit_a_narrow_pane(self):
+        app, _ = self.app()
+        self.keys(app, "x")
+        lines = app.render(30, 20)
+        self.assertEqual({md.width(line) for line in lines}, {30})
+        text = " ".join(plain(line).strip("│ ") for line in lines)
+        self.assertIn("Kill zellij session dotfiles?", text)
+        self.assertIn("y  kill", text)
+        self.assertIn("n  cancel", text)
+
+    # ------------------------------------------------------------ actions
+
+    def test_switch_stays_open(self):
+        app, runner = self.app(listed=("tmux",), inside=("tmux",), env=dict(TMUX_ENV))
+        self.keys(app, "j")
+        app.inbox.kinds()
+        self.keys(app, "enter")
+        self.assertEqual(runner.calls, [["tmux", "switch-client", "-t", "$1"]])
+        self.assertIsNone(app.result)
+        self.assertEqual(app.toast[:2], ("Switched to monopi.", False))
+        self.assertFalse(app.focused)
+        self.assertEqual(app.inbox.kinds(), [("load", "tmux")])
+
+    def test_switch_to_another_session_and_agent(self):
+        app, runner = self.app()
+        app.groups["zellij"].sessions.append(md.Session("zellij", "ztwo"))
+        self.keys(app, "G", "enter")
+        self.assertEqual(runner.calls, [["zellij", "action", "switch-session", "ztwo"]])
+        self.assertIsNone(app.result)
+        app.groups["zellij"].sessions[0].current = True
+        self.keys(app, "tab", "enter")
+        self.assertEqual(
+            runner.calls[-1], ["zellij", "action", "focus-pane-id", "terminal_2"]
+        )
+        self.assertIsNone(app.result)
+        self.assertEqual(app.toast[0], "Switched to claude in dotfiles.")
+
+    def test_escape_and_the_current_session_go_back(self):
+        app, runner = self.app()
+        app.groups["zellij"].sessions[0].current = True
+        self.keys(app, "enter")
+        self.keys(app, "esc")
+        back = ["zellij", "action", "focus-last-pane"]
+        self.assertEqual(runner.calls, [back, back])
+        self.assertIsNone(app.result)
+        self.assertFalse(app.focused)
+        # Escape first clears the filter.
+        app.filter = "dot"
+        self.keys(app, "esc")
+        self.assertEqual((app.filter, len(runner.calls)), ("", 2))
+
+        app, runner = self.app(listed=("tmux",), inside=("tmux",), env=dict(TMUX_ENV))
+        self.keys(app, "esc")
+        self.assertEqual(runner.calls, [["tmux", "last-pane", "-t", "%3"]])
+        failure = md.Result(1, "", "no last pane\n")
+        app, _ = self.app(
+            listed=("tmux",),
+            inside=("tmux",),
+            env=dict(TMUX_ENV),
+            answers={("tmux", "last-pane"): failure},
+        )
+        self.keys(app, "esc")
+        self.assertEqual(app.toast[:2], ("no last pane", True))
+
+    def test_herdr_has_no_back_command(self):
+        app, runner = self.app(listed=("herdr",), inside=("herdr",), env={})
+        self.keys(app, "esc")
+        self.assertEqual((runner.calls, app.result), ([], None))
+        self.assertNotIn("back", plain(app.render(80, 20)[-1]))
+
+    def test_the_click_that_gives_focus_only_selects(self):
+        app, runner = self.app()
+        app.render(30, 30)
+        row = next(h for h in app.hits if h.which == md.SESSIONS and h.index == 0)
+        click = md.Event("mouse", button=0, x=row.x0, y=row.y0)
+        release = md.Event("release", button=0, x=row.x0, y=row.y0)
+        app.handle(md.Event("focus", "in"))
+        app.handle(click)
+        app.handle(release)
+        self.assertEqual((runner.calls, app.result), ([], None))
+        app.handle(click)
+        app.handle(release)
+        self.assertEqual(
+            runner.calls, [["zellij", "action", "switch-session", "dotfiles"]]
+        )
+
+    def test_a_release_after_focus_in_is_the_click(self):
+        # zellij keeps the press that gives the pane focus and sends only
+        # the release.
+        app, runner = self.app()
+        app.groups["zellij"].sessions.append(md.Session("zellij", "ztwo"))
+        app.render(30, 30)
+        row = next(h for h in app.hits if h.which == md.SESSIONS and h.index == 2)
+        release = md.Event("release", button=0, x=row.x0, y=row.y0)
+        app.handle(release)
+        self.assertEqual(app.cursor[md.SESSIONS], 0)
+        app.handle(md.Event("focus", "in"))
+        app.handle(release)
+        self.assertEqual(app.selected().session.name, "ztwo")
+        app.handle(release)
+        self.assertEqual((runner.calls, app.result), ([], None))
+
+    def test_q_does_nothing_and_ctrl_c_quits(self):
+        app, runner = self.app()
+        self.keys(app, "q")
+        self.assertEqual((runner.calls, app.result), ([], None))
+        self.keys(app, "ctrl+c")
+        self.assertEqual(app.result.code, 0)
+
+    def test_create_stays_open(self):
+        answers = {("git",): md.Result(128, "", "not a git repository")}
+        app, runner = self.app(answers=answers)
+        app.options.directory = "/work/fresh"
+        self.keys(app, "n", "enter")
+        self.assertEqual(
+            runner.calls[-1],
+            ["zellij", "action", "switch-session", "fresh", "--cwd", "/work/fresh"],
+        )
+        self.assertIsNone(app.result)
+        self.assertEqual(app.toast[0], "Created fresh.")
+
+    def test_outside_a_multiplexer_switch_still_attaches(self):
+        app, _ = self.app(listed=("tmux",), inside=(), env={"HOME": "/home/me"})
+        self.keys(app, "q")
+        self.assertEqual(app.result.code, 0)
+        app, _ = self.app(listed=("tmux",), inside=(), env={"HOME": "/home/me"})
+        self.keys(app, "enter")
+        self.assertEqual(app.result.plan.attach, ["tmux", "attach-session", "-t", "$0"])
+        self.assertIn("q  quit", plain(app.render(80, 20)[-1]))
+
+    # ------------------------------------------------------------ refresh
+
+    def loaded(self, app, now):
+        for mux in app.ctx.listed:
+            app.receive("load", mux, app.groups[mux], now)
+
+    def test_refresh_times(self):
+        app, _ = self.app()
+        self.loaded(app, 100.0)
+        # Visible without focus: every 5 seconds.
+        app.tick(104.9)
+        self.assertNotIn(("load", "zellij"), app.inbox.kinds())
+        app.tick(105.0)
+        self.assertIn(("load", "zellij"), app.inbox.kinds())
+        self.loaded(app, 105.0)
+        # With focus: every 2 seconds.
+        app.handle(md.Event("focus", "in"))
+        self.assertIn(("load", "zellij"), app.inbox.kinds())
+        self.loaded(app, 105.0)
+        app.tick(106.9)
+        self.assertNotIn(("load", "zellij"), app.inbox.kinds())
+        app.tick(107.0)
+        self.assertIn(("load", "zellij"), app.inbox.kinds())
+        self.loaded(app, 107.0)
+        # Hidden: no full load.
+        app.handle(md.Event("focus", "out"))
+        app.receive("visible", None, False, 107.0)
+        app.tick(200.0)
+        self.assertEqual(app.inbox.kinds(), [("visible", None)])
+        # Visible again: a full load at once.
+        app.receive("visible", None, True, 201.0)
+        self.assertEqual(app.inbox.kinds(), [("load", "zellij")])
+
+    def test_a_key_press_counts_as_focus(self):
+        app, _ = self.app(listed=("tmux",), inside=("tmux",), env=dict(TMUX_ENV))
+        self.loaded(app, 100.0)
+        self.keys(app, "j")
+        self.assertTrue(app.focused)
+        # Without focus reports, the visibility checks go on, and a hidden
+        # pane loses the focus.
+        app.tick(102.0)
+        self.assertEqual(app.inbox.kinds(), [("load", "tmux"), ("visible", None)])
+        self.loaded(app, 102.0)
+        app.receive("visible", None, False, 102.0)
+        self.assertFalse(app.focused)
+        app.tick(300.0)
+        self.assertNotIn(("load", "tmux"), app.inbox.kinds())
+
+    def test_checks_run_only_without_focus(self):
+        app, _ = self.app()
+        app.handle(md.Event("focus", "in"))
+        app.inbox.kinds()
+        app.tick(100.0)
+        self.assertNotIn(("visible", None), app.inbox.kinds())
+        app.handle(md.Event("focus", "out"))
+        app.tick(100.0)
+        self.assertEqual(app.inbox.kinds(), [("visible", None)])
+        # One check at a time, then one every 3 seconds.
+        app.tick(100.5)
+        self.assertEqual(app.inbox.kinds(), [])
+        app.receive("visible", None, True, 101.0)
+        app.tick(103.9)
+        self.assertEqual(app.inbox.kinds(), [])
+        app.tick(104.0)
+        self.assertEqual(app.inbox.kinds(), [("visible", None)])
+
+    def test_the_check_asks_each_multiplexer(self):
+        clients = "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n1 terminal_4 N/A\n"
+        app, runner = self.app(answers={("zellij", "action", "list-clients"): clients})
+        app.backends["zellij"].pane_tabs = {"terminal_9": "0", "terminal_4": "1"}
+        app.tick(100.0)
+        (_, _, work), *_ = [s for s in app.inbox.spawned if s[0] == "visible"]
+        self.assertFalse(work())
+        self.assertEqual(runner.calls[-1], ["zellij", "action", "list-clients"])
+        # A multiplexer that does not answer does not hide the pane.
+        app.backends["zellij"].run = FakeRunner(
+            {("zellij",): md.Result(1, "", "no session")}
+        )
+        self.assertTrue(work())
+
+    def test_timeout(self):
+        app, _ = self.app()
+        self.loaded(app, 100.0)
+        app.next_check = 103.0
+        # Without focus: the next check, not 0.5 seconds.
+        self.assertAlmostEqual(app.timeout(100.0), 3.0)
+        app.checking = True
+        self.assertAlmostEqual(app.timeout(100.0), 5.0)
+        app.receive("visible", None, False, 100.0)
+        app.checking = True
+        self.assertEqual(app.timeout(100.0), 60.0)
+        # With focus, and outside sidebar mode, at most 0.5 seconds.
+        app.handle(md.Event("focus", "in"))
+        self.loaded(app, 100.0)
+        self.assertEqual(app.timeout(100.0), 0.5)
+        plain_app = make_app()
+        plain_app.selection = None
+        self.assertEqual(plain_app.timeout(100.0), 0.01)
+        plain_app.loaded_at = {m: 100.0 for m in plain_app.loaded_at}
+        self.assertEqual(plain_app.timeout(100.0), 0.5)
+
+    # ------------------------------------------------------------ parsers
+
+    def test_zellij_visibility(self):
+        tabs = {
+            "terminal_9": "0",
+            "terminal_1": "0",
+            "terminal_4": "1",
+            "plugin_2": "1",
+        }
+        visible = md.zellij_pane_visible
+        self.assertTrue(visible([("1", "terminal_1")], tabs, "terminal_9"))
+        self.assertTrue(visible([("1", "terminal_9")], tabs, "terminal_9"))
+        self.assertFalse(visible([("1", "terminal_4")], tabs, "terminal_9"))
+        self.assertFalse(visible([("1", "plugin_2")], tabs, "terminal_9"))
+        # No client shows the session.
+        self.assertFalse(visible([], tabs, "terminal_9"))
+        # Two clients, one of them in the dashboard's tab.
+        self.assertTrue(
+            visible([("1", "terminal_4"), ("2", "terminal_1")], tabs, "terminal_9")
+        )
+        # A pane made after the last load counts as in the tab.
+        self.assertTrue(visible([("1", "terminal_7")], tabs, "terminal_9"))
+        self.assertTrue(visible([("1", "terminal_4")], {}, "terminal_9"))
+
+    def test_zellij_pane_tabs_from_the_last_load(self):
+        self.assertEqual(
+            md.zellij_pane_tabs(
+                '[{"id": 1, "tab_id": 0}, {"id": 1, "is_plugin": true, "tab_id": 2}]'
+            ),
+            {"terminal_1": "0", "plugin_1": "2"},
+        )
+        runner = FakeRunner(
+            {
+                ("zellij", "list-sessions"): fixture("zellij/list-sessions.txt"),
+                ("zellij", "--session", "zdots2", "action", "list-panes"): fixture(
+                    "zellij/list-panes.json"
+                ),
+            }
+        )
+        z = md.Zellij(runner, {"ZELLIJ_SESSION_NAME": "zdots2", "ZELLIJ_PANE_ID": "3"})
+        z.load(inside=True)
+        self.assertEqual(z.pane_tabs["terminal_3"], "0")
+        self.assertEqual(z.own_pane, "terminal_3")
+
+    def test_tmux_visibility(self):
+        self.assertTrue(md.parse_tmux_visible("1 1\n"))
+        self.assertTrue(md.parse_tmux_visible("1 2\n"))
+        self.assertFalse(md.parse_tmux_visible("0 1\n"))
+        self.assertFalse(md.parse_tmux_visible("1 0\n"))
+        self.assertIsNone(md.parse_tmux_visible(""))
+        runner = FakeRunner({("tmux", "display-message"): "0 1\n"})
+        self.assertFalse(md.Tmux(runner, TMUX_ENV).visible())
+        self.assertEqual(
+            runner.calls,
+            [
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "%3",
+                    "#{window_active} #{session_attached}",
+                ]
+            ],
+        )
+        self.assertIsNone(md.Tmux(runner, {}).visible())
 
 
 if __name__ == "__main__":

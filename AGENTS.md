@@ -63,7 +63,19 @@ and the outcome to preserve, not a step-by-step patch.
   inside one of them, and a kill or rename can reach the user's real
   sessions. Run tests and ad-hoc checks in the isolated environment that
   `scripts/e2e.sh` sets up; a temporary `HOME` alone is not enough.
-- **zellij's `focus-pane-id` and `switch-session` work only in a pane
-  opened by a key binding**, as the dashboard is. From outside the session,
+- **zellij's `focus-pane-id` and `switch-session` move a client only when
+  they run in a pane with a client behind it**, such as a pane opened by a
+  key binding or a pane of the session's layout. From outside the session,
   or in a pane that `zellij --session S run` opened, they move no client.
-  Test zellij switching through a key binding, as `scripts/e2e.sh` does.
+  Test zellij switching through a key binding or a layout pane, as
+  `scripts/e2e.sh` does. With two clients in a session, only the client
+  whose focus is on the dashboard's pane moves.
+- **zellij keeps the mouse press that gives a pane focus.** The pane gets a
+  focus report and then only the release. The sidebar counts that release
+  as the click, so that one click on an unfocused sidebar selects a row.
+- **In a zellij layout, `children` inside a split stays empty** in a tab
+  with no content of its own, which is every tab that the user opens later.
+  The README's sidebar layout uses `new_tab_template` for that reason.
+- **Two Escape presses that arrive in one read are Alt+Escape.** In the
+  end-to-end tests, wait for the first Escape to take effect before sending
+  the second.
