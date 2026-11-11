@@ -114,7 +114,7 @@ height = 40
 `multiplexer-dashboard --sidebar` shows only the Sessions and Agents lists,
 so it fits a pane of about 30 columns. Inside a multiplexer it stays open:
 Enter takes you to the session or agent and the pane stays, Escape gives
-focus back to the pane you came from, `q` does nothing, and Ctrl+C quits.
+focus back to the pane you came from, and `q` quits.
 
 zellij: to give every tab of every session a sidebar, including the sessions
 that you create with `n`, add a `new_tab_template` to your default layout,

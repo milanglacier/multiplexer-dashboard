@@ -47,8 +47,8 @@ that tmux picks for the calling process.
 a narrow pane that stays next to the work, such as one in every tab of a
 zellij layout or a tmux split. Inside a multiplexer the dashboard then stays
 open after a switch, Escape gives focus back to the last pane (in zellij
-and tmux), q does nothing, and Ctrl+C quits. The lists refresh every 2 seconds while
-the pane has focus, every 5 seconds while it is on screen without focus,
+and tmux), and q quits. The lists refresh every 2 seconds while the pane
+has focus, every 5 seconds while it is on screen without focus,
 and not at all while it is hidden, such as in a tab that is not shown. A
 hidden pane asks its multiplexer every 3 seconds whether it is on screen
 again.
@@ -2351,10 +2351,12 @@ class App:
         elif k == "ctrl+l":
             self.redraw_all = True
             self.refresh()
-        elif k in ("q", "esc"):
-            if k == "esc" and self.filter:
+        elif k == "q":
+            self.result = Exit(0)
+        elif k == "esc":
+            if self.filter:
                 self.filter = ""
-            elif k == "esc" or not self.stays_open:
+            else:
                 self.back()
 
     def session_dialog(self, k: str) -> None:
@@ -2788,10 +2790,9 @@ class View:
             ("x", "kill"),
         ]
         help_and_out = [("?", "help")]
-        if not app.stays_open:
-            help_and_out.append(("q", "quit"))
-        elif app.back_command:
+        if app.stays_open and app.back_command:
             help_and_out.append(("esc", "back"))
+        help_and_out.append(("q", "quit"))
         # A narrow sidebar shows only the first keys, so there help and the
         # way out come right after switch, and the help shows the rest.
         if app.options.sidebar:
@@ -2912,7 +2913,7 @@ class View:
             else:
                 if app.back_command:
                     rows.append(("Esc", "back to the last pane"))
-                rows.append(("ctrl+c", "quit"))
+                rows.append(("q", "quit"))
             lines = [""]
             for k, v in rows:
                 # A description too long for the dialog goes on under itself.

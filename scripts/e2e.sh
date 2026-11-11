@@ -592,12 +592,9 @@ EOF
     eventually "focus is back on the claude pane" "$claude_side" zclients zside
     check "the sidebar still runs" "$(dash_pane zside 1)" "$side_two"
 
-    step "zellij sidebar: q does nothing, and n makes a session with the sidebar"
+    step "zellij sidebar: n makes a session with the sidebar"
     click $w 6 $((row + 2))
     eventually "the sidebar has focus" "$side_two" zclients zside
-    t send-keys -t $w q
-    sleep 0.5
-    check "q leaves the sidebar open" "$(dash_pane zside 1)" "$side_two"
     t send-keys -t $w n
     wait_for $w "New session" >/dev/null
     t send-keys -t $w -l zfresh
@@ -648,6 +645,11 @@ wait_gone $w "/beta" >/dev/null
 t send-keys -t $w Escape
 eventually "the shell pane is active again" "$side_shell" tm display -p -c "$client" '#{pane_id}'
 check "the sidebar still runs" "$(tm list-panes -t side: -F '#{pane_id}' | grep -c -- "$side_pane")" 1
+
+step "tmux sidebar: q quits"
+tm select-pane -t "$side_pane"
+t send-keys -t $w q
+eventually "the sidebar pane closed" 0 sh -c "tmux list-panes -t side: -F '#{pane_id}' | grep -c -- '$side_pane'"
 t kill-window -t $w
 tm kill-session -t side
 

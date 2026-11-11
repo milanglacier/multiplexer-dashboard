@@ -9,6 +9,8 @@
 - [x] Unit tests.
 - [x] End-to-end tests.
 - [x] README section, `--help` text and AGENTS.md notes.
+- [x] `q` quits in the sidebar too, as the user asked after the first
+  version, and the footer and help show `q quit` next to `esc back`.
 
 ## Findings while implementing
 

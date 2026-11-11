@@ -1199,14 +1199,14 @@ class SidebarTest(unittest.TestCase):
         app, _ = self.app()
         footer = plain(app.render(60, 20)[-1])
         self.assertIn("esc  back", footer)
-        self.assertNotIn("quit", footer)
+        self.assertIn("q  quit", footer)
         # The help comes second, so that a narrow pane shows it.
         self.assertIn("?  help", plain(app.render(30, 20)[-1]))
         self.keys(app, "?")
         text = "\n".join(plain(line) for line in app.render(30, 30))
         self.assertIn("Esc      back to the", text)
         self.assertIn("         last pane", text)
-        self.assertIn("ctrl+c   quit", text)
+        self.assertIn("q        quit", text)
 
     def test_narrow_agent_row_drops_the_tab_first(self):
         app, _ = self.app()
@@ -1324,12 +1324,11 @@ class SidebarTest(unittest.TestCase):
         app.handle(release)
         self.assertEqual((runner.calls, app.result), ([], None))
 
-    def test_q_does_nothing_and_ctrl_c_quits(self):
-        app, runner = self.app()
-        self.keys(app, "q")
-        self.assertEqual((runner.calls, app.result), ([], None))
-        self.keys(app, "ctrl+c")
-        self.assertEqual(app.result.code, 0)
+    def test_q_and_ctrl_c_quit(self):
+        for key in ("q", "ctrl+c"):
+            app, runner = self.app()
+            self.keys(app, key)
+            self.assertEqual((runner.calls, app.result.code), ([], 0))
 
     def test_create_stays_open(self):
         answers = {("git",): md.Result(128, "", "not a git repository")}
