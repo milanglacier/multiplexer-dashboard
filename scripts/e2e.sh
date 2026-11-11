@@ -282,7 +282,7 @@ if have zellij; then
     wait_for $w "exited" && echo "ok: an exited zellij session is listed"
 fi
 if have herdr; then
-    wait_for $w "● blocked" && echo "ok: herdr's agent status"
+    wait_for $w "× blocked" && echo "ok: herdr's agent status"
 fi
 check "the cursor starts on the first session" \
     "$(screen $w | grep -A1 -m1 '│ [a-z]* ─' | tail -1 | grep -c '▌')" 1

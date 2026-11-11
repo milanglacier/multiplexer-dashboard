@@ -44,6 +44,16 @@ Design plans live in `.plans/{active,completed}/<name>/plan.md`, with
 progress in `progress.md` next to each plan. Completed plans are history and
 may be out of date; the code is current.
 
+## Documentation
+
+- `README.md` is for users: installing, binding a key, and using the
+  dashboard. Keep implementation details out of it, such as the icon of
+  each agent status or the commands the dashboard runs in each multiplexer.
+- Update AGENTS.md (symlinked to CLAUDE.md) for nontrivial decisions and for
+  anything the code and scripts cannot explain themselves, such as pitfalls,
+  constraints or how to test. Do not restate what the code or its comments
+  already say.
+
 # Notes and Rabbit Holes
 
 Knowledge the code does not show. When adding a note, describe the problem

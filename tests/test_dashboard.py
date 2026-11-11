@@ -105,6 +105,13 @@ class AgentDetectionTest(unittest.TestCase):
         self.assertEqual(md.agent_icon("claude"), "✻")
         self.assertEqual(md.agent_icon("myagent"), md.CUSTOM_AGENT_ICON)
 
+    def test_status_icons_differ_from_agent_icons(self):
+        statuses = list(md.STATUS_ICONS.values())
+        self.assertEqual(len(set(statuses)), len(statuses))
+        self.assertEqual({md.width(i) for i in statuses}, {1})
+        agents = set(md.AGENT_ICONS.values()) | {md.CUSTOM_AGENT_ICON}
+        self.assertFalse(agents & set(statuses))
+
     def test_extra_names_from_the_environment(self):
         names = md.agent_names({"MULTIPLEXER_DASHBOARD_AGENTS": " kimi, ,myagent "})
         self.assertEqual(md.detect_agent(["kimi"], names), "kimi")
@@ -1037,7 +1044,7 @@ class ScreenTest(unittest.TestCase):
             )
         )
         text = "\n".join(plain(line) for line in app.render(120, 30))
-        self.assertIn("blocked", text)
+        self.assertIn("× blocked", text)
         app.set_group(md.Group("herdr", error="server not running"))
         text = "\n".join(plain(line) for line in app.render(120, 30))
         self.assertIn("server not running", text)

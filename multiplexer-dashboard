@@ -758,7 +758,7 @@ AGENT_ICONS = {
     "aider": "▲",
     "amp": "↯",
     "crush": "❖",
-    "goose": "◐",
+    "goose": "⬢",
     "cursor-agent": "➤",
     "qwen": "◈",
     "droid": "◉",
@@ -770,6 +770,16 @@ DEFAULT_AGENTS = tuple(AGENT_ICONS)
 CUSTOM_AGENT_ICON = "◇"
 INTERPRETER_RE = re.compile(r"node|nodejs|bun|deno|python[0-9.]*")
 SCRIPT_EXT_RE = re.compile(r"\.(?:c?js|mjs|ts|py)$")
+
+
+# The icon of each agent status, the same as herdr's "symbols" style.
+STATUS_ICONS = {
+    "working": "◐",
+    "blocked": "×",
+    "done": "✓",
+    "idle": "○",
+    "unknown": "·",
+}
 
 
 def agent_icon(name: str) -> str:
@@ -2366,18 +2376,21 @@ class View:
     def status(self, a: Agent, pen: Pen, wide: bool) -> str:
         t = Canvas.theme
         st = a.status
+        glyph = STATUS_ICONS.get(st or "")
+        if glyph is None:
+            return ""
+        bold = st == "blocked"
         if st == "working":
-            glyph, color, bold = SPINNER[self.frame % len(SPINNER)], t.gold, False
+            color = t.gold
         elif st == "blocked":
             # Pulses, since it waits for the user.
-            glyph, bold = "●", True
             color = t.love if (self.frame // 6) % 2 == 0 else mix(t.love, t.base, 0.45)
         elif st == "idle":
-            glyph, color, bold = "○", t.foam, False
+            color = t.foam
         elif st == "done":
-            glyph, color, bold = "✓", t.pine, False
+            color = t.pine
         else:
-            return ""
+            color = t.muted
         return pen(f"{glyph} {st} " if wide else f"{glyph} ", color, bold=bold)
 
     def agent_row(self, a: Agent, w: int, pen: Pen, is_sel: bool) -> str:
