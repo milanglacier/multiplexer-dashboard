@@ -1,0 +1,2 @@
+sh-5.3$ claude
+[0m[1m[38;5;5mfake claude[0m in /home/me/proj/repo-a

@@ -1,0 +1,12 @@
+      1       0 /sbin/init
+   4000       1 node /usr/lib/node_modules/gemini/bin/gemini
+2682068 2682067 -bash
+2682071 2682067 -bash
+2682074 2682067 -bash
+2682077 2682067 claude /home/me/lib/agent-loop
+2682080 2682067 node /home/me/lib/node_modules/gemini/bin/gemini
+2682084 2682067 -bash
+2682089 2682068 codex /home/me/lib/agent-loop
+2682090 2682077 sleep 1000
+2682093 2682089 sleep 1000
+2682098 2682080 sleep 1000

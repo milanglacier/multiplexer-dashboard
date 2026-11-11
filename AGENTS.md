@@ -30,7 +30,13 @@ nix develop -c make check
 ```
 
 After changing Python code, including tests, run `make check` and fix any
-failures.
+failures. `make check` runs the unit tests on Python 3.9 and on the current
+Python. Any change to terminal handling, key routing or a multiplexer
+command must also pass the end-to-end tests:
+
+```sh
+nix develop -c make e2e
+```
 
 ## Plans
 
@@ -44,6 +50,10 @@ Knowledge the code does not show. When adding a note, describe the problem
 and the outcome to preserve, not a step-by-step patch.
 
 - **Never touch the user's own multiplexers.** You are probably running
-  inside one of them. Tests and ad-hoc checks use a private tmux socket,
-  `TMUX_TMPDIR`, a temporary `HOME`, and unset every `HERDR_*` variable.
-  Otherwise a kill or rename can reach the user's real sessions.
+  inside one of them, and a kill or rename can reach the user's real
+  sessions. Run tests and ad-hoc checks in the isolated environment that
+  `scripts/e2e.sh` sets up; a temporary `HOME` alone is not enough.
+- **zellij's `focus-pane-id` and `switch-session` work only in a pane
+  opened by a key binding**, as the dashboard is. From outside the session,
+  or in a pane that `zellij --session S run` opened, they move no client.
+  Test zellij switching through a key binding, as `scripts/e2e.sh` does.

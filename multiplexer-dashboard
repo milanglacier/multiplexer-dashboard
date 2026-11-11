@@ -1,0 +1,2724 @@
+#!/usr/bin/env python3
+"""A fullscreen picker for tmux, zellij and herdr sessions and the coding
+agents that run in them.
+
+Usage: multiplexer-dashboard [--multiplexer tmux|zellij|herdr]
+                             [--client CLIENT] [--dir DIR]
+                             [--theme auto|light|dark] [--no-bg]
+
+The left column lists sessions above agents, both grouped by multiplexer in
+the order zellij, herdr, tmux. The right side previews the selected
+session's focused pane or the selected agent's pane, in that pane's own
+colors. Enter switches to the selected session or jumps to the selected
+agent's pane, and the dashboard then exits.
+
+Inside a multiplexer, found from the environment variables TMUX, ZELLIJ and
+HERDR_ENV=1, the dashboard lists only that multiplexer, or each one it runs
+in when nested. Outside any multiplexer it lists every installed one, and a
+switch replaces the dashboard with a client that attaches to the session.
+--multiplexer limits the list to one multiplexer.
+
+Herdr has no sessions in the sense of tmux, because a herdr session is a
+whole server. The dashboard lists the workspaces of the default herdr server
+as sessions, as multiplexer-new-session does.
+
+An agent is a pane whose foreground program is one of claude, codex,
+opencode, pi, gemini, aider, amp, crush, goose, cursor-agent, qwen, droid and
+copilot, or of the comma-separated names in MULTIPLEXER_DASHBOARD_AGENTS.
+When the foreground program is an interpreter (node, bun, deno or python),
+the name comes from the first argument that is not an option, such as
+".../bin/gemini". Herdr reports its own agents and their status.
+
+New sessions are named as multiplexer-new-session names them: "~" for the
+home directory, the name of the repository's root directory inside a git
+repository, and the directory name otherwise. A name typed in the dialog
+replaces this automatic name. Each character other than a letter, a digit,
+"_", "-" or "~" becomes "-", so that a name is valid in all three
+multiplexers. When a session with the name exists, the dashboard switches to
+it instead. The directory is DIR, or else the current directory, except
+inside herdr, where it is the directory of the current pane.
+
+CLIENT is the tmux client to switch inside tmux. It defaults to the client
+that tmux picks for the calling process.
+
+Keys: j/k or the arrows move, g/G or Home/End jump to the ends, Alt+j/k or
+Alt+arrows jump between multiplexers, Tab switches lists, Enter switches,
+/ filters, n creates, r renames, x kills, Ctrl+L refreshes, ? shows every
+key, and q or Escape quits. A click selects a row, a second click switches,
+and the wheel moves the cursor.
+"""
+
+from __future__ import annotations
+
+import argparse
+import codecs
+import json
+import os
+import queue
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+import unicodedata
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Callable, NamedTuple
+
+MULTIPLEXERS = ("zellij", "herdr", "tmux")
+SCRIPT = os.path.abspath(__file__)
+SESSIONS, AGENTS = 0, 1
+REFRESH_SECONDS = 2.0
+PREVIEW_DELAY = 0.1
+MIN_COLS, MIN_ROWS, PREVIEW_MIN_COLS = 40, 12, 72
+
+# ---------------------------------------------------------------- terminal
+
+
+class Event(NamedTuple):
+    """A key press, named as "j", "enter" or "alt+up", or a mouse press at a
+    0-based cell."""
+
+    kind: str
+    key: str = ""
+    button: int = 0
+    x: int = 0
+    y: int = 0
+
+
+MOUSE_RE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+# A late reply to a terminal query, which is ignored.
+OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+# A lone ESC is the Escape key. ESC followed by [ or O starts a sequence, and
+# ESC followed by any other key is Alt with that key.
+KEY_SEQ_RE = re.compile(
+    r"\x1b?\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b[\s\S]",
+)
+# Modified arrows and Home/End, such as ESC [ 1 ; 3 A for Alt+Up.
+MOD_KEY_RE = re.compile(r"\x1b\[1;(\d+)([A-DHF])")
+KEY_NAMES = {
+    "\x1b[A": "up",
+    "\x1bOA": "up",
+    "\x1b[B": "down",
+    "\x1bOB": "down",
+    "\x1b[C": "right",
+    "\x1bOC": "right",
+    "\x1b[D": "left",
+    "\x1bOD": "left",
+    "\x1b[H": "home",
+    "\x1bOH": "home",
+    "\x1b[1~": "home",
+    "\x1b[7~": "home",
+    "\x1b[F": "end",
+    "\x1bOF": "end",
+    "\x1b[4~": "end",
+    "\x1b[8~": "end",
+    "\x1b[5~": "pgup",
+    "\x1b[6~": "pgdown",
+    "\x1b[3~": "delete",
+    "\x1b[Z": "shift+tab",
+    "\t": "tab",
+    "\r": "enter",
+    "\n": "enter",
+    "\x7f": "backspace",
+    "\x08": "backspace",
+    "\x1b": "esc",
+    "\x03": "ctrl+c",
+    "\x0c": "ctrl+l",
+    "\x15": "ctrl+u",
+    "\x17": "ctrl+w",
+    "\x0e": "down",
+    "\x10": "up",
+}
+ARROWS = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end"}
+
+
+def key_name(seq: str) -> str:
+    if seq in KEY_NAMES:
+        return KEY_NAMES[seq]
+    m = MOD_KEY_RE.fullmatch(seq)
+    if m:
+        # The xterm modifier parameter is 1 + shift (1) + alt (2) + ctrl (4).
+        bits = int(m[1]) - 1
+        mods = [n for b, n in ((4, "ctrl"), (2, "alt"), (1, "shift")) if bits & b]
+        return "+".join(mods + [ARROWS[m[2]]])
+    if seq.startswith("\x1b\x1b["):
+        return "alt+" + key_name(seq[1:])
+    if len(seq) == 2 and seq[0] == "\x1b":
+        return "alt+" + KEY_NAMES.get(seq[1], seq[1])
+    return seq
+
+
+def parse_input(data: str) -> list[Event]:
+    """Turns the text of one read from the terminal into events. Mouse
+    releases and replies to terminal queries are dropped."""
+    events: list[Event] = []
+    i = 0
+    while i < len(data):
+        m = MOUSE_RE.match(data, i)
+        if m:
+            if m[4] == "M":
+                # Drop the shift, alt and ctrl bits.
+                button = int(m[1]) & ~0b11100
+                events.append(
+                    Event("mouse", button=button, x=int(m[2]) - 1, y=int(m[3]) - 1)
+                )
+            i = m.end()
+            continue
+        m = OSC_RE.match(data, i)
+        if m:
+            i = m.end()
+            continue
+        m = KEY_SEQ_RE.match(data, i)
+        seq = m.group() if m else data[i]
+        i = m.end() if m else i + 1
+        events.append(Event("key", key_name(seq)))
+    return events
+
+
+def luminance_is_dark(reply: bytes) -> bool | None:
+    """Reads an OSC 11 reply. None when it holds no color."""
+    m = re.search(rb"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", reply)
+    if not m:
+        return None
+    r, g, b = (int(x, 16) / (16 ** len(x) - 1) for x in m.groups())
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.5
+
+
+class Term:
+    """Raw mode, the alternate screen, mouse reporting and a renderer that
+    rewrites only the lines that changed, all on /dev/tty."""
+
+    def __init__(self, wake_fd: int) -> None:
+        self.fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        self.saved = termios.tcgetattr(self.fd)
+        self.wake_fd = wake_fd
+        self.prev: list[str] = []
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.resized = False
+
+    def write(self, s: str) -> None:
+        data = s.encode()
+        while data:
+            n = os.write(self.fd, data)
+            data = data[n:]
+
+    def __enter__(self) -> None:
+        tty.setraw(self.fd)
+        # Alternate screen, hidden cursor, button and wheel mouse in SGR form.
+        self.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h")
+
+    def __exit__(self, *exc: object) -> None:
+        # Each step is tried even when an earlier one fails, such as when
+        # the terminal has gone away.
+        try:
+            self.write("\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l")
+        except OSError:
+            pass
+        try:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        except (OSError, termios.error):
+            pass
+        os.close(self.fd)
+
+    def size(self) -> tuple[int, int]:
+        sz = os.get_terminal_size(self.fd)
+        return sz.columns, sz.lines
+
+    def background_is_dark(self) -> bool | None:
+        """Asks the terminal for its background color (OSC 11) and waits up
+        to 250 ms. None when the terminal does not answer."""
+        self.write("\x1b]11;?\x1b\\")
+        buf, deadline = b"", time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            r, _, _ = select.select(
+                [self.fd], [], [], max(0.0, deadline - time.monotonic())
+            )
+            if not r:
+                break
+            buf += os.read(self.fd, 256)
+            if buf.endswith((b"\x07", b"\x1b\\")):
+                break
+        return luminance_is_dark(buf)
+
+    def invalidate(self) -> None:
+        self.prev = []
+
+    def draw(self, lines: list[str]) -> None:
+        if self.resized:
+            self.resized = False
+            self.prev = []
+        # Synchronized output keeps the terminal from showing half a frame.
+        out = ["\x1b[?2026h"]
+        if len(self.prev) != len(lines):
+            out.append("\x1b[0m\x1b[2J")
+            self.prev = []
+        for y, line in enumerate(lines):
+            if y >= len(self.prev) or self.prev[y] != line:
+                out.append(f"\x1b[{y + 1};1H{line}{RESET}")
+        out.append("\x1b[?2026l")
+        if len(out) > 2:
+            self.write("".join(out))
+        self.prev = lines
+
+    def events(self, timeout: float) -> list[Event]:
+        """Waits up to timeout seconds for input or a wake-up, and returns
+        the input's events."""
+        r, _, _ = select.select([self.fd, self.wake_fd], [], [], max(0.0, timeout))
+        if self.fd not in r:
+            return []
+        return parse_input(self.decoder.decode(os.read(self.fd, 4096)))
+
+
+# ---------------------------------------------------------------- painting
+
+RGB = tuple[int, int, int]
+
+# Rose Pine and Rose Pine Dawn.
+PALETTES = {
+    "dark": {
+        "base": "#191724",
+        "surface": "#1f1d2e",
+        "overlay": "#26233a",
+        "muted": "#6e6a86",
+        "subtle": "#908caa",
+        "text": "#e0def4",
+        "love": "#eb6f92",
+        "gold": "#f6c177",
+        "rose": "#ebbcba",
+        "pine": "#31748f",
+        "foam": "#9ccfd8",
+        "iris": "#c4a7e7",
+        "hl_low": "#21202e",
+        "hl_med": "#403d52",
+        "hl_high": "#524f67",
+    },
+    "light": {
+        "base": "#faf4ed",
+        "surface": "#fffaf3",
+        "overlay": "#f2e9e1",
+        "muted": "#9893a5",
+        "subtle": "#797593",
+        "text": "#575279",
+        "love": "#b4637a",
+        "gold": "#ea9d34",
+        "rose": "#d7827e",
+        "pine": "#286983",
+        "foam": "#56949f",
+        "iris": "#907aa9",
+        "hl_low": "#f4ede8",
+        "hl_med": "#dfdad9",
+        "hl_high": "#cecacd",
+    },
+}
+
+
+def hex_rgb(h: str) -> RGB:
+    return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
+
+
+def mix(a: RGB, b: RGB, t: float) -> RGB:
+    return (
+        round(a[0] + (b[0] - a[0]) * t),
+        round(a[1] + (b[1] - a[1]) * t),
+        round(a[2] + (b[2] - a[2]) * t),
+    )
+
+
+class Theme:
+    base: RGB
+    surface: RGB
+    overlay: RGB
+    muted: RGB
+    subtle: RGB
+    text: RGB
+    love: RGB
+    gold: RGB
+    rose: RGB
+    pine: RGB
+    foam: RGB
+    iris: RGB
+    hl_low: RGB
+    hl_med: RGB
+    hl_high: RGB
+
+    def __init__(self, dark: bool, dim: float = 0.0) -> None:
+        colors = {
+            k: hex_rgb(v) for k, v in PALETTES["dark" if dark else "light"].items()
+        }
+        if dim:
+            # Behind a dialog, every color fades toward the background.
+            colors = {
+                k: v if k == "base" else mix(v, colors["base"], dim)
+                for k, v in colors.items()
+            }
+        for k, v in colors.items():
+            setattr(self, k, v)
+        self.dark = dark
+        self.dimmed = dim > 0
+
+    def mux(self, name: str) -> RGB:
+        return {"zellij": self.foam, "herdr": self.iris, "tmux": self.rose}.get(
+            name, self.text
+        )
+
+    def agent(self, name: str) -> RGB:
+        colors = {
+            "claude": self.gold,
+            "codex": self.foam,
+            "opencode": self.iris,
+            "pi": self.rose,
+        }
+        return colors.get(name, self.pine)
+
+
+RESET = "\x1b[0m"
+_DEFAULT: Any = object()
+
+
+class Canvas:
+    """Settings that every paint call reads: the theme and whether the app
+    paints its own background."""
+
+    theme = Theme(True)
+    paint_bg = True
+
+
+def sgr(
+    fg: RGB | None = None,
+    bg: RGB | None = None,
+    bold: bool = False,
+    dim: bool = False,
+    italic: bool = False,
+    underline: bool = False,
+) -> str:
+    codes = []
+    if bold:
+        codes.append("1")
+    if dim:
+        codes.append("2")
+    if italic:
+        codes.append("3")
+    if underline:
+        codes.append("4")
+    if fg is not None:
+        codes.append("38;2;{};{};{}".format(*fg))
+    if bg is not None:
+        codes.append("48;2;{};{};{}".format(*bg))
+    return "\x1b[" + ";".join(codes) + "m" if codes else ""
+
+
+def paint(text: str, fg: RGB | None = None, bg: Any = _DEFAULT, **kw: bool) -> str:
+    if not text:
+        return ""
+    if bg is _DEFAULT:
+        bg = Canvas.theme.base if Canvas.paint_bg else None
+    pre = sgr(fg, bg, **kw)
+    return pre + text + RESET if pre else text
+
+
+class Pen:
+    """Paints segments on one background, such as a selected row's."""
+
+    def __init__(self, bg: Any = _DEFAULT) -> None:
+        self.bg = bg
+
+    def __call__(self, text: str, fg: RGB | None = None, **kw: Any) -> str:
+        kw.setdefault("bg", self.bg)
+        return paint(text, fg, **kw)
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;:?<=>]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def cell_width(ch: str) -> int:
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def width(s: str) -> int:
+    return sum(cell_width(c) for c in ANSI_RE.sub("", s))
+
+
+def cut(s: str, start: int, end: int | None = None) -> str:
+    """The cells start..end of a painted string, with the colors in effect at
+    start carried over. A wide character that does not fit is left out."""
+    out: list[str] = []
+    active, n, i, started = "", 0, 0, False
+    while i < len(s):
+        m = ANSI_RE.match(s, i)
+        if m:
+            seq = m.group()
+            i = m.end()
+            if seq.endswith("m"):
+                active = "" if seq in (RESET, "\x1b[m") else active + seq
+                if started:
+                    out.append(seq)
+            continue
+        cw = cell_width(s[i])
+        if end is not None and n + cw > end:
+            break
+        if n >= start:
+            if not started:
+                out.append(active)
+                started = True
+            out.append(s[i])
+        n += cw
+        i += 1
+    return "".join(out) + RESET
+
+
+def fit(s: str, w: int, pen: Pen | None = None) -> str:
+    """Truncates a painted string with "…", or pads it, to exactly w cells."""
+    pen = pen or Pen()
+    if w <= 0:
+        return ""
+    if width(s) > w:
+        s = cut(s, 0, w - 1) + pen("…", Canvas.theme.muted)
+    return s + pen(" " * (w - width(s)))
+
+
+def lr(left: str, right: str, w: int, pen: Pen | None = None) -> str:
+    """Left-aligned and right-aligned text on one line of w cells."""
+    rw = width(right)
+    return fit(right, w, pen) if rw >= w else fit(left, w - rw, pen) + right
+
+
+def overlay(base: str, x: int, s: str) -> str:
+    return cut(base, 0, x) + s + cut(base, x + width(s))
+
+
+def gradient(text: str, c1: RGB, c2: RGB, fg: RGB) -> str:
+    n = max(1, len(text) - 1)
+    return "".join(
+        paint(ch, fg, mix(c1, c2, i / n), bold=True) for i, ch in enumerate(text)
+    )
+
+
+def plural(n: int, unit: str) -> str:
+    return f"{n} {unit}" + ("" if n == 1 else "s")
+
+
+def format_age(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+# Escape sequences in captured pane text: CSI, OSC, DCS and friends, and
+# two-character escapes.
+CAPTURE_SEQ_RE = re.compile(
+    r"\x1b\[[0-9;:<=>?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|\x1b[PX^_][^\x1b]*(?:\x1b\\)?"
+    r"|\x1b[ -/]*[0-~]?"
+)
+SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
+
+
+def sanitize_capture(text: str) -> list[str]:
+    """Captured pane text as lines that keep their SGR sequences (colors and
+    styles) and nothing else: other escape sequences and control characters
+    are dropped, tabs are expanded, and trailing blank lines are removed."""
+    lines: list[str] = []
+    for raw_line in text.replace("\r\n", "\n").split("\n"):
+        out: list[str] = []
+        col, i = 0, 0
+        while i < len(raw_line):
+            ch = raw_line[i]
+            if ch == "\x1b":
+                m = CAPTURE_SEQ_RE.match(raw_line, i)
+                if m:
+                    if SGR_RE.fullmatch(m.group()):
+                        out.append(m.group())
+                    i = m.end()
+                    continue
+                i += 1
+                continue
+            i += 1
+            if ch == "\t":
+                n = 8 - col % 8
+                out.append(" " * n)
+                col += n
+            elif ord(ch) < 32 or 0x7F <= ord(ch) < 0xA0:
+                continue
+            else:
+                out.append(ch)
+                col += cell_width(ch)
+        lines.append("".join(out))
+    while lines and not ANSI_RE.sub("", lines[-1]).strip():
+        lines.pop()
+    return lines
+
+
+def resets_background(params: str) -> bool:
+    """Whether an SGR parameter list resets the background or the dimming:
+    0 (or nothing), 22 or 49. Colors given as 38;5;N or 38;2;R;G;B are
+    skipped, so that a 0 inside a color does not count."""
+    if params in ("", "0"):
+        return True
+    parts = params.split(";")
+    i = 0
+    while i < len(parts):
+        p = parts[i].split(":")[0]
+        if p in ("38", "48", "58") and ":" not in parts[i]:
+            if i + 1 < len(parts) and parts[i + 1] == "5":
+                i += 3
+                continue
+            if i + 1 < len(parts) and parts[i + 1] == "2":
+                i += 5
+                continue
+        if p in ("", "0", "22", "49"):
+            return True
+        i += 1
+    return False
+
+
+def raw(line: str) -> str:
+    """A captured pane line on the app's background, faded when the screen
+    is dimmed behind a dialog."""
+    t = Canvas.theme
+    pre = (sgr(bg=t.base) if Canvas.paint_bg else "") + ("\x1b[2m" if t.dimmed else "")
+    if not pre:
+        return line + RESET
+    body = SGR_RE.sub(
+        lambda m: m.group() + pre if resets_background(m[1]) else m.group(), line
+    )
+    return pre + body + RESET
+
+
+# ---------------------------------------------------------------- commands
+
+
+class Result(NamedTuple):
+    code: int
+    out: str
+    err: str
+
+
+Runner = Callable[[Sequence[str]], Result]
+
+
+def run_command(args: Sequence[str], timeout: float = 5.0) -> Result:
+    """Runs a command without a shell and returns its status and output."""
+    try:
+        p = subprocess.run(
+            list(args),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return Result(127, "", f"{args[0]}: command not found")
+    except subprocess.TimeoutExpired:
+        return Result(124, "", f"{args[0]}: no answer after {timeout:g} seconds")
+    except OSError as e:
+        return Result(126, "", f"{args[0]}: {e.strerror}")
+    return Result(
+        p.returncode,
+        p.stdout.decode("utf-8", "replace"),
+        p.stderr.decode("utf-8", "replace"),
+    )
+
+
+def herdr_error(text: str) -> tuple[str, str] | None:
+    """The code and message of a herdr error, which herdr prints as JSON."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    err = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        return None
+    return str(err.get("code", "")), str(err.get("message", ""))
+
+
+def error_text(r: Result) -> str:
+    """One line that says why a command failed."""
+    text = r.err.strip() or r.out.strip()
+    herdr = herdr_error(text)
+    if herdr:
+        return (
+            "server not running"
+            if herdr[0] == "server_not_running"
+            else herdr[1] or herdr[0]
+        )
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[0] if lines else f"exit status {r.code}"
+
+
+def run_parallel(calls: Sequence[Callable[[], Any]]) -> list[Any]:
+    """Runs the calls in threads and returns their results in order."""
+    results: list[Any] = [None] * len(calls)
+
+    def work(i: int, call: Callable[[], Any]) -> None:
+        results[i] = call()
+
+    threads = [
+        threading.Thread(target=work, args=(i, c), daemon=True)
+        for i, c in enumerate(calls)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+# ---------------------------------------------------------------- model data
+
+
+@dataclass
+class Session:
+    mux: str
+    name: str
+    # The herdr workspace id or the tmux session id; empty for zellij, where
+    # the name is the id.
+    id: str = ""
+    path: str = ""
+    created: float | None = None
+    tabs: int = 0
+    attached: bool = False
+    exited: bool = False
+    current: bool = False
+    # How long ago a zellij session exited, as zellij prints it.
+    age: str = ""
+    # The focused pane of the active tab, for the preview.
+    pane: str = ""
+
+    @property
+    def key(self) -> str:
+        return self.id or self.name
+
+
+@dataclass
+class Agent:
+    mux: str
+    session: str
+    session_key: str
+    tab: str
+    tab_index: int
+    pane: str
+    name: str
+    path: str = ""
+    status: str | None = None
+    # The zellij or herdr tab id.
+    tab_id: str = ""
+
+
+@dataclass
+class Group:
+    """What one multiplexer reports: its sessions and agents, or why it
+    failed. A group is loading until its first answer arrives."""
+
+    mux: str
+    sessions: list[Session] = field(default_factory=list)
+    agents: list[Agent] = field(default_factory=list)
+    error: str | None = None
+    loading: bool = False
+
+
+@dataclass
+class Plan:
+    """The commands of an action. The steps run in order and the first
+    failure stops them. Outside a multiplexer, attach is the client that
+    then replaces the dashboard, started in cwd, and helper is a command
+    started in the background just before it."""
+
+    steps: list[list[str]] = field(default_factory=list)
+    attach: list[str] | None = None
+    cwd: str | None = None
+    helper: list[str] | None = None
+
+
+# ---------------------------------------------------------------- agents
+
+DEFAULT_AGENTS = (
+    "claude",
+    "codex",
+    "opencode",
+    "pi",
+    "gemini",
+    "aider",
+    "amp",
+    "crush",
+    "goose",
+    "cursor-agent",
+    "qwen",
+    "droid",
+    "copilot",
+)
+INTERPRETER_RE = re.compile(r"node|nodejs|bun|deno|python[0-9.]*")
+SCRIPT_EXT_RE = re.compile(r"\.(?:c?js|mjs|ts|py)$")
+
+
+def agent_names(env: Mapping[str, str]) -> frozenset[str]:
+    extra = env.get("MULTIPLEXER_DASHBOARD_AGENTS", "")
+    return frozenset(DEFAULT_AGENTS) | {
+        n.strip() for n in extra.split(",") if n.strip()
+    }
+
+
+def is_interpreter(program: str) -> bool:
+    return bool(INTERPRETER_RE.fullmatch(program))
+
+
+def detect_agent(argv: Sequence[str], names: frozenset[str]) -> str | None:
+    """The agent that a command line runs, or None. For an interpreter, the
+    agent is the basename of the first argument that is not an option."""
+    if not argv:
+        return None
+    # A login shell's name starts with "-".
+    program = os.path.basename(argv[0]).lstrip("-")
+    if program in names:
+        return program
+    if is_interpreter(program):
+        for arg in argv[1:]:
+            if arg.startswith("-"):
+                continue
+            base = SCRIPT_EXT_RE.sub("", os.path.basename(arg))
+            return base if base in names else None
+    return None
+
+
+class ProcessTree:
+    """A snapshot of `ps -A -o pid=,ppid=,args=`."""
+
+    def __init__(self, text: str) -> None:
+        self.args: dict[int, list[str]] = {}
+        self.children: dict[int, list[int]] = {}
+        for line in text.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                continue
+            pid, ppid = int(parts[0]), int(parts[1])
+            self.args[pid] = parts[2].split() if len(parts) > 2 else []
+            self.children.setdefault(ppid, []).append(pid)
+
+    def agent_under(self, pid: int, names: frozenset[str]) -> str | None:
+        """The agent of the deepest process at or below pid that runs one."""
+        best: tuple[int, str | None] = (-1, None)
+        stack = [(pid, 0)]
+        seen: set[int] = set()
+        while stack:
+            p, depth = stack.pop()
+            if p in seen:
+                continue
+            seen.add(p)
+            name = detect_agent(self.args.get(p, []), names)
+            if name and depth > best[0]:
+                best = (depth, name)
+            stack.extend((c, depth + 1) for c in self.children.get(p, []))
+        return best[1]
+
+
+# ---------------------------------------------------------------- tmux
+
+TMUX_SESSION_FORMAT = (
+    "#{session_name}\t#{session_id}\t#{session_created}\t#{session_windows}\t"
+    "#{session_attached}\t#{session_path}"
+)
+TMUX_PANE_FORMAT = (
+    "#{session_id}\t#{window_index}\t#{window_name}\t#{window_active}\t"
+    "#{pane_active}\t#{pane_last}\t#{pane_id}\t#{pane_current_command}\t"
+    "#{pane_pid}\t#{pane_current_path}"
+)
+
+
+class TmuxPane(NamedTuple):
+    session_id: str
+    window_index: int
+    window_name: str
+    window_active: bool
+    pane_active: bool
+    pane_last: bool
+    pane_id: str
+    command: str
+    pid: int
+    path: str
+
+
+def to_int(s: str, default: int = 0) -> int:
+    try:
+        return int(s)
+    except ValueError:
+        return default
+
+
+def parse_tmux_sessions(text: str) -> list[Session]:
+    """Sessions from `list-sessions -F TMUX_SESSION_FORMAT`, in creation
+    order."""
+    sessions = []
+    for line in text.splitlines():
+        f = line.split("\t")
+        if len(f) != 6:
+            continue
+        sessions.append(
+            Session(
+                "tmux",
+                f[0],
+                id=f[1],
+                created=float(to_int(f[2])),
+                tabs=to_int(f[3]),
+                attached=to_int(f[4]) > 0,
+                path=f[5],
+            )
+        )
+    sessions.sort(key=lambda s: (s.created or 0, to_int(s.id.lstrip("$"))))
+    return sessions
+
+
+def parse_tmux_panes(text: str) -> list[TmuxPane]:
+    """Panes from `list-panes -a -F TMUX_PANE_FORMAT`."""
+    panes = []
+    for line in text.splitlines():
+        f = line.split("\t")
+        if len(f) != 10:
+            continue
+        panes.append(
+            TmuxPane(
+                f[0],
+                to_int(f[1]),
+                f[2],
+                f[3] == "1",
+                f[4] == "1",
+                f[5] == "1",
+                f[6],
+                f[7],
+                to_int(f[8]),
+                f[9],
+            )
+        )
+    return panes
+
+
+def tmux_snapshot(
+    sessions: list[Session],
+    panes: list[TmuxPane],
+    procs: ProcessTree | None,
+    names: frozenset[str],
+    current_id: str | None,
+    own_pane: str = "",
+) -> Group:
+    """Joins the sessions and panes: each session gets its focused pane and
+    that pane's directory, and each agent pane becomes an agent. When the
+    dashboard's own pane (own_pane) is the focused one, the pane that was
+    focused before it counts instead."""
+    by_id = {s.id: s for s in sessions}
+    order = {s.id: i for i, s in enumerate(sessions)}
+    for s in sessions:
+        s.current = s.id == current_id
+        window = [
+            p
+            for p in panes
+            if p.session_id == s.id and p.window_active and p.pane_id != own_pane
+        ]
+        focused = (
+            next((p for p in window if p.pane_active), None)
+            or next((p for p in window if p.pane_last), None)
+            or (window[0] if window else None)
+        )
+        if focused:
+            s.pane, s.path = focused.pane_id, focused.path or s.path
+    agents = []
+    for p in panes:
+        s = by_id.get(p.session_id)
+        if not s:
+            continue
+        name = p.command if p.command in names else None
+        if not name and procs and is_interpreter(p.command):
+            name = procs.agent_under(p.pid, names)
+        if name:
+            agents.append(
+                Agent(
+                    "tmux",
+                    s.name,
+                    s.id,
+                    p.window_name,
+                    p.window_index,
+                    p.pane_id,
+                    name,
+                    p.path,
+                )
+            )
+    agents.sort(
+        key=lambda a: (order[a.session_key], a.tab_index, to_int(a.pane.lstrip("%")))
+    )
+    return Group("tmux", sessions, agents)
+
+
+class Tmux:
+    name = "tmux"
+
+    def __init__(
+        self, runner: Runner, env: Mapping[str, str], client: str | None = None
+    ) -> None:
+        self.run = runner
+        self.env = env
+        self.client = client
+        self.names = agent_names(env)
+
+    def client_args(self) -> list[str]:
+        return ["-c", self.client] if self.client else []
+
+    def load(self, inside: bool) -> Group:
+        r = self.run(["tmux", "list-sessions", "-F", TMUX_SESSION_FORMAT])
+        if r.code != 0:
+            msg = error_text(r)
+            if "no server running" in msg or "error connecting to" in msg:
+                return Group("tmux")
+            return Group("tmux", error=msg)
+        sessions = parse_tmux_sessions(r.out)
+        p = self.run(["tmux", "list-panes", "-a", "-F", TMUX_PANE_FORMAT])
+        panes = parse_tmux_panes(p.out) if p.code == 0 else []
+        procs = None
+        if any(is_interpreter(pane.command) for pane in panes):
+            ps = self.run(["ps", "-A", "-o", "pid=,ppid=,args="])
+            procs = ProcessTree(ps.out) if ps.code == 0 else None
+        current = self.current_session() if inside else None
+        own = self.env.get("TMUX_PANE", "") if inside else ""
+        return tmux_snapshot(sessions, panes, procs, self.names, current, own)
+
+    def current_session(self) -> str | None:
+        # display-message -c still formats the calling pane's session.
+        if self.client:
+            r = self.run(
+                ["tmux", "list-clients", "-F", "#{client_name}\t#{session_id}"]
+            )
+            for line in r.out.splitlines():
+                name, _, sid = line.partition("\t")
+                if name == self.client:
+                    return sid
+            return None
+        r = self.run(["tmux", "display-message", "-p", "#{session_id}"])
+        return r.out.strip() if r.code == 0 else None
+
+    def switch_session(self, s: Session, inside: bool) -> Plan:
+        # The session id, since tmux reads ":" and "." in a name as window
+        # and pane separators.
+        if inside:
+            return Plan([["tmux", "switch-client", *self.client_args(), "-t", s.id]])
+        return Plan(attach=["tmux", "attach-session", "-t", s.id])
+
+    def switch_agent(self, a: Agent, inside: bool, current: str | None) -> Plan:
+        # A pane target also selects the pane's window and the pane.
+        if inside:
+            return Plan([["tmux", "switch-client", *self.client_args(), "-t", a.pane]])
+        return Plan(attach=["tmux", "attach-session", "-t", a.pane])
+
+    def create(self, name: str, directory: str, inside: bool) -> Plan:
+        if inside:
+            return Plan(
+                [
+                    ["tmux", "new-session", "-d", "-s", name, "-c", directory],
+                    ["tmux", "switch-client", *self.client_args(), "-t", "=" + name],
+                ]
+            )
+        return Plan(attach=["tmux", "new-session", "-s", name, "-c", directory])
+
+    def rename(self, s: Session, new: str) -> Plan:
+        return Plan([["tmux", "rename-session", "-t", s.id, new]])
+
+    def kill(self, s: Session) -> Plan:
+        return Plan([["tmux", "kill-session", "-t", s.id]])
+
+    def capture(self, pane: str, s: Session | None) -> Result:
+        return self.run(["tmux", "capture-pane", "-e", "-p", "-t", pane])
+
+    def default_dir(self, inside: bool) -> str | None:
+        return None
+
+
+# ---------------------------------------------------------------- zellij
+
+ZELLIJ_SESSION_RE = re.compile(
+    r"^(?P<name>.+?) \[Created (?P<age>.*?) ago\](?P<rest>.*)$"
+)
+DURATION_RE = re.compile(r"(\d+)\s*([a-zA-Z]+)")
+
+
+def parse_duration(text: str) -> float:
+    """Seconds in a duration as zellij prints it, such as "2days 3h 4m 5s"."""
+    total = 0.0
+    for n, unit in DURATION_RE.findall(text):
+        u = unit.lower()
+        if u in ("ms", "us", "ns", "µs"):
+            continue
+        if u.startswith("y"):
+            scale = 365.25 * 86400
+        elif u.startswith("mo") or u == "mon":
+            scale = 30.44 * 86400
+        elif u.startswith("w"):
+            scale = 7 * 86400
+        elif u.startswith("d"):
+            scale = 86400
+        elif u.startswith("h"):
+            scale = 3600
+        elif u.startswith("m"):
+            scale = 60
+        else:
+            scale = 1
+        total += int(n) * scale
+    return total
+
+
+def parse_zellij_sessions(text: str, now: float) -> list[Session]:
+    """Sessions from `list-sessions --no-formatting`: running sessions in
+    creation order, then the exited ones that zellij can resurrect. zellij
+    prints ages in whole seconds, so sessions created in the same second
+    come in no fixed order."""
+    running, exited = [], []
+    for line in text.splitlines():
+        m = ZELLIJ_SESSION_RE.match(line.strip())
+        if not m:
+            continue
+        rest, age = m["rest"], parse_duration(m["age"])
+        if "EXITED" in rest:
+            exited.append(
+                Session("zellij", m["name"], exited=True, age=format_age(age))
+            )
+        else:
+            running.append(
+                Session(
+                    "zellij", m["name"], created=now - age, current="(current)" in rest
+                )
+            )
+    running.sort(key=lambda s: s.created or 0)
+    return running + exited
+
+
+def parse_zellij_panes(
+    s: Session,
+    panes_json: str,
+    tabs_json: str | None,
+    names: frozenset[str],
+    own_pane: str = "",
+) -> list[Agent]:
+    """Fills in a session's tab count, focused pane and directory from
+    `action list-panes -a -j` and `action list-tabs -j -s`, and returns its
+    agents. The focused pane is one of the active tab's, a tiled one before
+    a floating one, and never the dashboard's own pane (own_pane)."""
+    panes = json.loads(panes_json)
+    tabs: list[dict[str, Any]] = []
+    if tabs_json:
+        try:
+            tabs = json.loads(tabs_json)
+        except ValueError:
+            tabs = []
+    terminals = [p for p in panes if not p.get("is_plugin") and not p.get("exited")]
+    # A background session can have tabs without panes.
+    s.tabs = len(tabs) or len({p.get("tab_id") for p in panes})
+    active = next((t.get("tab_id") for t in tabs if t.get("active")), None)
+    if active is None:
+        positions = sorted(
+            ((p.get("tab_position", 0), p.get("tab_id")) for p in terminals),
+            key=lambda x: x[0],
+        )
+        active = positions[0][1] if positions else None
+    in_tab = [
+        p
+        for p in terminals
+        if p.get("tab_id") == active and f"terminal_{p['id']}" != own_pane
+    ]
+    in_tab.sort(key=lambda p: (not p.get("is_focused"), bool(p.get("is_floating"))))
+    focused = in_tab[0] if in_tab else None
+    if focused:
+        s.pane = f"terminal_{focused['id']}"
+        s.path = focused.get("pane_cwd") or ""
+    agents = []
+    for p in terminals:
+        command = p.get("pane_command") or p.get("terminal_command") or ""
+        name = detect_agent(command.split(), names)
+        if name:
+            agents.append(
+                Agent(
+                    "zellij",
+                    s.name,
+                    s.name,
+                    p.get("tab_name") or "",
+                    int(p.get("tab_position") or 0),
+                    f"terminal_{p['id']}",
+                    name,
+                    p.get("pane_cwd") or "",
+                    tab_id=str(p.get("tab_id", "")),
+                )
+            )
+    agents.sort(key=lambda a: (a.tab_index, to_int(a.pane.split("_")[-1])))
+    return agents
+
+
+def parse_zellij_clients(text: str) -> list[tuple[str, str]]:
+    """Client ids and their focused panes from `action list-clients`."""
+    clients = []
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 2:
+            clients.append((f[0], f[1]))
+    return clients
+
+
+def zellij_focus_pane(
+    session: str, tab_id: str, pane: str, runner: Runner = run_command
+) -> int:
+    """Waits up to 10 seconds for a client to attach to a session that had
+    none, then moves it to a pane. This runs in the background while an
+    attaching client replaces the dashboard. zellij's focus-pane-id does not
+    move a client when it comes from outside the session, but
+    go-to-tab-by-id and focus-next-pane move the session's first client."""
+    base = ["zellij", "--session", session, "action"]
+
+    def clients() -> list[tuple[str, str]]:
+        r = runner(base + ["list-clients"])
+        return parse_zellij_clients(r.out) if r.code == 0 else []
+
+    deadline = time.monotonic() + 10
+    while not clients():
+        if time.monotonic() > deadline:
+            return 1
+        time.sleep(0.1)
+    if tab_id:
+        runner(base + ["go-to-tab-by-id", tab_id])
+    for _ in range(64):
+        if any(p == pane for _, p in clients()):
+            return 0
+        runner(base + ["focus-next-pane"])
+    return 1
+
+
+class Zellij:
+    name = "zellij"
+
+    def __init__(
+        self, runner: Runner, env: Mapping[str, str], client: str | None = None
+    ) -> None:
+        self.run = runner
+        self.env = env
+        self.names = agent_names(env)
+
+    def load(self, inside: bool) -> Group:
+        r = self.run(["zellij", "list-sessions", "--no-formatting"])
+        if r.code != 0:
+            if "No active zellij sessions" in r.out + r.err:
+                return Group("zellij")
+            return Group("zellij", error=error_text(r))
+        sessions = parse_zellij_sessions(r.out, time.time())
+        current = self.env.get("ZELLIJ_SESSION_NAME") if inside else None
+        own = f"terminal_{self.env.get('ZELLIJ_PANE_ID')}" if inside else ""
+        for s in sessions:
+            s.current = (s.current and inside) or s.name == current
+        running = [s for s in sessions if not s.exited]
+
+        def details(s: Session) -> tuple[Result, Result]:
+            base = ["zellij", "--session", s.name, "action"]
+            return self.run(base + ["list-panes", "-a", "-j"]), self.run(
+                base + ["list-tabs", "-j", "-s"]
+            )
+
+        agents: list[Agent] = []
+        for s, (panes, tabs) in zip(
+            running, run_parallel([lambda s=s: details(s) for s in running])
+        ):
+            if panes.code != 0:
+                continue
+            try:
+                tabs_json = tabs.out if tabs.code == 0 else None
+                own_pane = own if s.current else ""
+                agents += parse_zellij_panes(
+                    s, panes.out, tabs_json, self.names, own_pane
+                )
+            except (ValueError, KeyError, TypeError):
+                continue
+        return Group("zellij", sessions, agents)
+
+    def has_clients(self, session: str) -> bool:
+        r = self.run(["zellij", "--session", session, "action", "list-clients"])
+        return r.code == 0 and bool(parse_zellij_clients(r.out))
+
+    def switch_session(self, s: Session, inside: bool) -> Plan:
+        if inside:
+            return Plan([["zellij", "action", "switch-session", s.name]])
+        return Plan(attach=["zellij", "attach", s.name])
+
+    def switch_agent(self, a: Agent, inside: bool, current: str | None) -> Plan:
+        if not inside:
+            helper = [sys.executable, SCRIPT, "--zellij-focus-pane"]
+            return Plan(
+                attach=["zellij", "attach", a.session],
+                helper=helper + [a.session, a.tab_id, a.pane],
+            )
+        if a.session == current:
+            return Plan([["zellij", "action", "focus-pane-id", a.pane]])
+        return Plan(
+            [["zellij", "action", "switch-session", a.session, "--pane-id", a.pane]]
+        )
+
+    def create(self, name: str, directory: str, inside: bool) -> Plan:
+        if inside:
+            return Plan(
+                [["zellij", "action", "switch-session", name, "--cwd", directory]]
+            )
+        return Plan(attach=["zellij", "--session", name], cwd=directory)
+
+    def rename(self, s: Session, new: str) -> Plan:
+        return Plan([["zellij", "--session", s.name, "action", "rename-session", new]])
+
+    def kill(self, s: Session) -> Plan:
+        return Plan(
+            [["zellij", "delete-session" if s.exited else "kill-session", s.name]]
+        )
+
+    def capture(self, pane: str, s: Session | None) -> Result:
+        session = s.name if s else ""
+        return self.run(
+            [
+                "zellij",
+                "--session",
+                session,
+                "action",
+                "dump-screen",
+                "--ansi",
+                "--pane-id",
+                pane,
+            ]
+        )
+
+    def default_dir(self, inside: bool) -> str | None:
+        return None
+
+
+# ---------------------------------------------------------------- herdr
+
+
+def herdr_result(text: str) -> dict[str, Any]:
+    data = json.loads(text)
+    result = data.get("result") if isinstance(data, dict) else None
+    return result if isinstance(result, dict) else {}
+
+
+def parse_herdr(
+    workspaces_json: str,
+    tabs_json: str | None,
+    panes_json: str | None,
+    agents_json: str | None,
+    inside: bool,
+) -> Group:
+    """Workspaces as sessions, in workspace number order, and herdr's agents
+    with their status, from the JSON of `workspace list`, `tab list`, `pane
+    list` and `agent list`."""
+    workspaces = herdr_result(workspaces_json).get("workspaces") or []
+    tabs = herdr_result(tabs_json).get("tabs") or [] if tabs_json else []
+    panes = herdr_result(panes_json).get("panes") or [] if panes_json else []
+    raw_agents = herdr_result(agents_json).get("agents") or [] if agents_json else []
+    tab_by_id = {t.get("tab_id"): t for t in tabs}
+    sessions = []
+    for w in sorted(workspaces, key=lambda w: w.get("number") or 0):
+        s = Session(
+            "herdr",
+            str(w.get("label") or w.get("workspace_id")),
+            id=str(w.get("workspace_id")),
+            tabs=int(w.get("tab_count") or 0),
+            current=inside and bool(w.get("focused")),
+        )
+        in_tab = [p for p in panes if p.get("tab_id") == w.get("active_tab_id")]
+        pane = next(
+            (p for p in in_tab if p.get("focused")), in_tab[0] if in_tab else None
+        )
+        if pane:
+            s.pane = str(pane.get("pane_id"))
+            s.path = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+        sessions.append(s)
+    by_id = {s.id: s for s in sessions}
+    order = {s.id: i for i, s in enumerate(sessions)}
+    agents = []
+    for a in raw_agents:
+        s = by_id.get(a.get("workspace_id"))
+        if not s or not a.get("agent"):
+            continue
+        tab = tab_by_id.get(a.get("tab_id")) or {}
+        agents.append(
+            Agent(
+                "herdr",
+                s.name,
+                s.id,
+                str(tab.get("label") or tab.get("number") or ""),
+                int(tab.get("number") or 0),
+                str(a.get("pane_id")),
+                str(a.get("agent")),
+                str(a.get("foreground_cwd") or a.get("cwd") or ""),
+                a.get("agent_status"),
+                tab_id=str(a.get("tab_id") or ""),
+            )
+        )
+    agents.sort(
+        key=lambda a: (
+            order[a.session_key],
+            a.tab_index,
+            to_int(a.pane.rpartition(":p")[2]),
+        )
+    )
+    return Group("herdr", sessions, agents)
+
+
+class Herdr:
+    name = "herdr"
+
+    def __init__(
+        self, runner: Runner, env: Mapping[str, str], client: str | None = None
+    ) -> None:
+        self.run = runner
+        self.env = env
+
+    def load(self, inside: bool) -> Group:
+        r = self.run(["herdr", "workspace", "list"])
+        if r.code != 0:
+            return Group("herdr", error=error_text(r))
+        tabs, panes, agents = run_parallel(
+            [
+                lambda: self.run(["herdr", "tab", "list"]),
+                lambda: self.run(["herdr", "pane", "list"]),
+                lambda: self.run(["herdr", "agent", "list"]),
+            ]
+        )
+
+        def ok(x: Result) -> str | None:
+            return x.out if x.code == 0 else None
+
+        try:
+            return parse_herdr(r.out, ok(tabs), ok(panes), ok(agents), inside)
+        except (ValueError, TypeError, AttributeError) as e:
+            return Group("herdr", error=f"unexpected answer: {e}")
+
+    def server_running(self) -> bool:
+        return self.run(["herdr", "workspace", "list"]).code == 0
+
+    def start_server(self) -> str | None:
+        """Starts the default herdr server in the background when none runs,
+        and waits up to 5 seconds for it to answer. Returns an error."""
+        if self.server_running():
+            return None
+        try:
+            subprocess.Popen(
+                ["herdr", "server"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as e:
+            return f"herdr: {e.strerror}"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if self.server_running():
+                return None
+            time.sleep(0.1)
+        return "the herdr server did not start"
+
+    def switch_session(self, s: Session, inside: bool) -> Plan:
+        return Plan(
+            [["herdr", "workspace", "focus", s.id]],
+            attach=None if inside else ["herdr"],
+        )
+
+    def switch_agent(self, a: Agent, inside: bool, current: str | None) -> Plan:
+        return Plan(
+            [["herdr", "agent", "focus", a.pane]], attach=None if inside else ["herdr"]
+        )
+
+    def create(self, name: str, directory: str, inside: bool) -> Plan:
+        return Plan(
+            [
+                [
+                    "herdr",
+                    "workspace",
+                    "create",
+                    "--cwd",
+                    directory,
+                    "--label",
+                    name,
+                    "--focus",
+                ]
+            ],
+            attach=None if inside else ["herdr"],
+        )
+
+    def rename(self, s: Session, new: str) -> Plan:
+        return Plan([["herdr", "workspace", "rename", s.id, new]])
+
+    def kill(self, s: Session) -> Plan:
+        return Plan([["herdr", "workspace", "close", s.id]])
+
+    def capture(self, pane: str, s: Session | None) -> Result:
+        if s is not None:
+            # The session's pane is one of its active tab; ask for the tab's
+            # focused pane.
+            r = self.run(["herdr", "pane", "layout", "--pane", pane])
+            if r.code == 0:
+                try:
+                    pane = str(herdr_result(r.out)["layout"]["focused_pane_id"] or pane)
+                except (ValueError, KeyError, TypeError):
+                    pass
+        return self.run(
+            ["herdr", "pane", "read", pane, "--source", "visible", "--format", "ansi"]
+        )
+
+    def default_dir(self, inside: bool) -> str | None:
+        """Inside herdr, the directory of the current pane."""
+        if not inside or not self.env.get("HERDR_PANE_ID"):
+            return None
+        r = self.run(["herdr", "pane", "current", "--current"])
+        if r.code != 0:
+            return None
+        try:
+            pane = herdr_result(r.out).get("pane") or {}
+        except ValueError:
+            return None
+        return pane.get("foreground_cwd") or pane.get("cwd") or None
+
+
+BACKENDS = {"tmux": Tmux, "zellij": Zellij, "herdr": Herdr}
+
+# ---------------------------------------------------------------- naming
+
+
+def sanitize_name(name: str) -> str:
+    """Replaces each character other than a letter, a digit, "_", "-" or "~"
+    with "-"."""
+    return "".join(c if c.isalnum() or c in "_-~" else "-" for c in name)
+
+
+def dir_label(directory: str, home: str, git_root: str | None) -> str:
+    """The automatic session name for a directory: "~" for the home
+    directory, the repository's root directory name inside a git repository,
+    and the directory name otherwise."""
+    if os.path.normpath(directory) == os.path.normpath(home):
+        return "~"
+    root = os.path.normpath(git_root or directory)
+    return os.path.basename(root) or root
+
+
+def git_root(runner: Runner, directory: str) -> str | None:
+    r = runner(["git", "-C", directory, "rev-parse", "--show-toplevel"])
+    return r.out.strip() or None if r.code == 0 else None
+
+
+# ---------------------------------------------------------------- context
+
+
+@dataclass
+class Context:
+    """The listed multiplexers, in display order, and the ones the dashboard
+    runs inside."""
+
+    listed: list[str]
+    inside: set[str]
+
+    @property
+    def label(self) -> str:
+        if not self.inside:
+            return "outside any multiplexer"
+        return "in " + " and ".join(m for m in MULTIPLEXERS if m in self.inside)
+
+
+def detected_multiplexers(env: Mapping[str, str]) -> set[str]:
+    found = set()
+    if env.get("TMUX"):
+        found.add("tmux")
+    if env.get("ZELLIJ"):
+        found.add("zellij")
+    if env.get("HERDR_ENV") == "1":
+        found.add("herdr")
+    return found
+
+
+def detect_context(
+    env: Mapping[str, str], installed: Callable[[str], Any], only: str | None = None
+) -> Context:
+    """Inside multiplexers, the listed ones are those; outside, every
+    installed one. --multiplexer (only) limits the list to one."""
+    inside = detected_multiplexers(env)
+    if only:
+        return Context([only], inside & {only})
+    if inside:
+        return Context([m for m in MULTIPLEXERS if m in inside], inside)
+    return Context([m for m in MULTIPLEXERS if installed(m)], set())
+
+
+# ---------------------------------------------------------------- rows
+
+
+@dataclass
+class Row:
+    kind: str  # "group", "session" or "agent"
+    mux: str
+    session: Session | None = None
+    agent: Agent | None = None
+    count: int = 0
+    note: str = ""
+
+
+def item_key(row: Row) -> tuple[str, ...]:
+    if row.session:
+        return ("session", row.mux, row.session.key)
+    if row.agent:
+        return ("agent", row.mux, row.agent.session_key, row.agent.pane)
+    return ("group", row.mux)
+
+
+def build_rows(groups: Sequence[Group], which: int, query: str) -> list[Row]:
+    """The rows of a list: a header per multiplexer, then its matching
+    items. Without a filter, the sessions list shows every multiplexer's
+    header, so that a loading, failing or empty one is still visible."""
+    q = query.lower()
+    rows: list[Row] = []
+    for g in groups:
+        items: list[Row]
+        if which == SESSIONS:
+            items = [
+                Row("session", g.mux, session=s)
+                for s in g.sessions
+                if q in s.name.lower()
+            ]
+        else:
+            items = [
+                Row("agent", g.mux, agent=a)
+                for a in g.agents
+                if not q or any(q in f.lower() for f in (a.name, a.session, a.tab))
+            ]
+        if items or (which == SESSIONS and not q):
+            note = "loading…" if g.loading else g.error or ""
+            rows.append(Row("group", g.mux, count=len(items), note=note))
+            rows += items
+    return rows
+
+
+def items_of(rows: Sequence[Row]) -> list[Row]:
+    return [r for r in rows if r.kind != "group"]
+
+
+def scroll_offset(
+    rows: Sequence[Row], cursor_row: int | None, offset: int, height: int
+) -> int:
+    """The first visible row. It changes only when the cursor would leave
+    the view, and shows a group's header above its first item."""
+    if cursor_row is not None:
+        top = (
+            cursor_row - 1
+            if cursor_row > 0 and rows[cursor_row - 1].kind == "group"
+            else cursor_row
+        )
+        if top < offset:
+            offset = top
+        elif cursor_row >= offset + height:
+            offset = cursor_row - height + 1
+    return max(0, min(offset, len(rows) - height))
+
+
+def jump_group(items: Sequence[Row], cursor: int, direction: int) -> int:
+    """The first item of the next or previous multiplexer, wrapping around."""
+    if not items:
+        return 0
+    firsts = [i for i, r in enumerate(items) if i == 0 or items[i - 1].mux != r.mux]
+    if direction > 0:
+        later = [i for i in firsts if i > cursor]
+        return later[0] if later else firsts[0]
+    earlier = [i for i in firsts if i < cursor]
+    return earlier[-1] if earlier else firsts[-1]
+
+
+# ---------------------------------------------------------------- app
+
+
+@dataclass
+class Exit:
+    """How the dashboard ends: its exit status, and outside a multiplexer
+    the plan whose client replaces it."""
+
+    code: int = 0
+    plan: Plan | None = None
+
+
+@dataclass
+class Preview:
+    generation: int
+    lines: list[str]
+    error: str = ""
+
+
+class Hit(NamedTuple):
+    """A screen area that a click or the wheel acts on: a whole list panel
+    (index -1) or one of its items."""
+
+    which: int
+    index: int
+    y0: int
+    y1: int
+    x0: int
+    x1: int
+
+
+class Inbox:
+    """Results of work on other threads. A thread puts its result in the
+    queue and writes a byte to a pipe, which wakes the main loop."""
+
+    def __init__(self) -> None:
+        self.queue: queue.Queue[tuple[str, Any, Any]] = queue.Queue()
+        self.read_fd, self.write_fd = os.pipe()
+        os.set_blocking(self.read_fd, False)
+        os.set_blocking(self.write_fd, False)
+
+    def wake(self) -> None:
+        try:
+            os.write(self.write_fd, b"x")
+        except OSError:
+            pass
+
+    def spawn(self, kind: str, key: Any, work: Callable[[], Any]) -> None:
+        def target() -> None:
+            try:
+                value = work()
+            except Exception as e:  # noqa: BLE001 - shown in the dashboard
+                value = e
+            self.queue.put((kind, key, value))
+            self.wake()
+
+        threading.Thread(target=target, daemon=True).start()
+
+    def drain(self) -> list[tuple[str, Any, Any]]:
+        try:
+            while os.read(self.read_fd, 4096):
+                pass
+        except OSError:
+            pass
+        out = []
+        while True:
+            try:
+                out.append(self.queue.get_nowait())
+            except queue.Empty:
+                return out
+
+
+@dataclass
+class Options:
+    client: str | None = None
+    directory: str | None = None
+    dark: bool = True
+    paint_bg: bool = True
+
+
+class App:
+    """The dashboard's state and its reaction to input and loaded data."""
+
+    def __init__(
+        self,
+        ctx: Context,
+        options: Options,
+        runner: Runner = run_command,
+        env: Mapping[str, str] = os.environ,
+        inbox: Inbox | None = None,
+    ) -> None:
+        self.ctx = ctx
+        self.options = options
+        self.runner = runner
+        self.env = env
+        self.inbox = inbox
+        self.backends = {
+            m: BACKENDS[m](runner, env, options.client) for m in ctx.listed
+        }
+        self.groups = {m: Group(m, loading=True) for m in ctx.listed}
+        self.focus = SESSIONS
+        self.cursor = [0, 0]
+        self.offset = [0, 0]
+        # The item to put the cursor on when it appears, such as a renamed
+        # session.
+        self.wanted: list[tuple[str, ...] | None] = [None, None]
+        # Whether the user has moved a list's cursor. Until then, the cursor
+        # stays on the first row while the multiplexers answer.
+        self.touched = [False, False]
+        self.filter = ""
+        self.mode: str | None = None  # filter, new, rename, kill or help
+        self.input = ""
+        self.target: Row | None = None
+        self.new_mux = ctx.listed[0] if ctx.listed else ""
+        self.new_dirs: dict[str, tuple[str, str]] = {}
+        self.toast: tuple[str, bool, float] | None = None
+        self.hits: list[Hit] = []
+        self.result: Exit | None = None
+        self.redraw_all = False
+        self.loading: dict[str, bool] = {m: False for m in ctx.listed}
+        self.next_load: dict[str, float] = {m: 0.0 for m in ctx.listed}
+        self.generation: dict[str, int] = {m: 0 for m in ctx.listed}
+        self.previews: dict[tuple[str, ...], Preview] = {}
+        self.capturing: set[tuple[str, ...]] = set()
+        self.selection: tuple[str, ...] | None = None
+        self.selection_since = 0.0
+        self.view = View(self)
+
+    # ------------------------------------------------------------ queries
+
+    def ordered_groups(self) -> list[Group]:
+        return [self.groups[m] for m in self.ctx.listed]
+
+    def rows(self, which: int) -> list[Row]:
+        return build_rows(self.ordered_groups(), which, self.filter)
+
+    def items(self, which: int) -> list[Row]:
+        return items_of(self.rows(which))
+
+    def selected(self, which: int | None = None) -> Row | None:
+        w = self.focus if which is None else which
+        items = self.items(w)
+        if not items:
+            return None
+        return items[max(0, min(self.cursor[w], len(items) - 1))]
+
+    def inside(self, mux: str) -> bool:
+        return mux in self.ctx.inside
+
+    def current_session(self, mux: str) -> Session | None:
+        return next((s for s in self.groups[mux].sessions if s.current), None)
+
+    def agents_of(self, s: Session) -> list[Agent]:
+        return [a for a in self.groups[s.mux].agents if a.session_key == s.key]
+
+    def clamp(self) -> None:
+        for w in (SESSIONS, AGENTS):
+            self.cursor[w] = max(0, min(self.cursor[w], len(self.items(w)) - 1))
+
+    # ------------------------------------------------------------ loading
+
+    def start_load(self, mux: str) -> None:
+        if self.loading[mux] or self.inbox is None:
+            return
+        self.loading[mux] = True
+        backend, inside = self.backends[mux], self.inside(mux)
+        self.inbox.spawn("load", mux, lambda: backend.load(inside))
+
+    def refresh(self) -> None:
+        for mux in self.ctx.listed:
+            self.start_load(mux)
+
+    def receive(self, kind: str, key: Any, value: Any, now: float) -> None:
+        if kind == "load":
+            self.loading[key] = False
+            self.next_load[key] = now + REFRESH_SECONDS
+            group = (
+                value
+                if isinstance(value, Group)
+                else Group(key, error=f"failed: {value}")
+            )
+            self.set_group(group)
+        elif kind == "preview":
+            self.capturing.discard(key)
+            generation, result = value if isinstance(value, tuple) else (0, value)
+            if isinstance(result, Exception):
+                self.previews[key] = Preview(generation, [], str(result))
+            elif result.code != 0:
+                self.previews[key] = Preview(generation, [], error_text(result))
+            else:
+                self.previews[key] = Preview(generation, sanitize_capture(result.out))
+
+    def set_group(self, group: Group) -> None:
+        """Replaces a multiplexer's data and keeps each cursor on the same
+        session or agent when it still exists."""
+        before = [self.selected(w) for w in (SESSIONS, AGENTS)]
+        keys = [item_key(r) if r else None for r in before]
+        self.groups[group.mux] = group
+        self.generation[group.mux] += 1
+        for w in (SESSIONS, AGENTS):
+            items = [item_key(r) for r in self.items(w)]
+            want, had = self.wanted[w], keys[w]
+            if want and want in items:
+                self.cursor[w] = items.index(want)
+                self.wanted[w] = None
+            elif had and had in items and self.touched[w]:
+                self.cursor[w] = items.index(had)
+        self.clamp()
+
+    # ------------------------------------------------------------ timing
+
+    def tick(self, now: float) -> None:
+        for mux in self.ctx.listed:
+            if not self.loading[mux] and now >= self.next_load[mux]:
+                self.start_load(mux)
+        if self.toast and now > self.toast[2]:
+            self.toast = None
+        row = self.selected()
+        key = item_key(row) if row else None
+        if key != self.selection:
+            self.selection, self.selection_since = key, now
+        elif row and key and now - self.selection_since >= PREVIEW_DELAY:
+            self.maybe_capture(row, key)
+
+    def timeout(self, now: float) -> float:
+        """How long the main loop may wait for input."""
+        waits = [0.5]
+        waits += [
+            self.next_load[m] - now for m in self.ctx.listed if not self.loading[m]
+        ]
+        preview_due = self.selection_since + PREVIEW_DELAY
+        if self.selection and now < preview_due:
+            waits.append(preview_due - now)
+        if self.toast:
+            waits.append(self.toast[2] - now)
+        if any(
+            a.status in ("working", "blocked")
+            for g in self.groups.values()
+            for a in g.agents
+        ):
+            waits.append(0.1)
+        return max(0.01, min(waits))
+
+    # ------------------------------------------------------------ preview
+
+    def preview_target(self, row: Row) -> tuple[str, Session | None] | None:
+        """The pane to capture for a row, and the session that the capture
+        needs: the row's own session, or a zellij agent's session."""
+        if row.agent:
+            # zellij needs the session to find the pane.
+            zellij = row.mux == "zellij"
+            return row.agent.pane, Session(
+                "zellij", row.agent.session
+            ) if zellij else None
+        if row.session and not row.session.exited and row.session.pane:
+            return row.session.pane, row.session
+        return None
+
+    def maybe_capture(self, row: Row, key: tuple[str, ...]) -> None:
+        if self.inbox is None or key in self.capturing:
+            return
+        generation = self.generation[row.mux]
+        have = self.previews.get(key)
+        if have and have.generation == generation:
+            return
+        target = self.preview_target(row)
+        if not target:
+            return
+        backend = self.backends[row.mux]
+        pane, session = target
+        self.capturing.add(key)
+        self.inbox.spawn(
+            "preview", key, lambda: (generation, backend.capture(pane, session))
+        )
+
+    # ------------------------------------------------------------ actions
+
+    def say(self, text: str, warn: bool = False, seconds: float = 5.0) -> None:
+        self.toast = (text, warn, time.monotonic() + seconds)
+
+    def run_steps(self, plan: Plan) -> bool:
+        """Runs a plan's steps in order. The first failure stops them and
+        shows its error."""
+        for step in plan.steps:
+            r = self.runner(step)
+            if r.code != 0:
+                self.say(error_text(r), warn=True)
+                return False
+        return True
+
+    def execute(self, plan: Plan) -> None:
+        """Runs a plan's steps. On success the dashboard exits, or hands over
+        to the attaching client."""
+        if self.run_steps(plan):
+            self.result = Exit(0, plan if plan.attach else None)
+
+    def switch(self, row: Row) -> None:
+        mux, inside = row.mux, self.inside(row.mux)
+        backend = self.backends[mux]
+        if row.session:
+            if row.session.current and inside:
+                self.result = Exit(0)
+                return
+            self.execute(backend.switch_session(row.session, inside))
+        elif row.agent:
+            current = self.current_session(mux)
+            plan = backend.switch_agent(
+                row.agent, inside, current.name if current else None
+            )
+            # The helper moves the session's first client, which is the
+            # attaching one only when the session has no other client.
+            if (
+                plan.helper
+                and isinstance(backend, Zellij)
+                and backend.has_clients(row.agent.session)
+            ):
+                plan.helper = None
+            self.execute(plan)
+
+    def new_session_dir(self, mux: str) -> tuple[str, str]:
+        """The directory and automatic name of a new session in mux."""
+        if mux not in self.new_dirs:
+            directory = (
+                self.options.directory
+                or self.backends[mux].default_dir(self.inside(mux))
+                or os.getcwd()
+            )
+            directory = os.path.abspath(os.path.expanduser(directory))
+            home = self.env.get("HOME") or os.path.expanduser("~")
+            name = sanitize_name(
+                dir_label(directory, home, git_root(self.runner, directory))
+            )
+            self.new_dirs[mux] = (directory, name)
+        return self.new_dirs[mux]
+
+    def create(self, mux: str, typed: str) -> None:
+        directory, automatic = self.new_session_dir(mux)
+        name = sanitize_name(typed.strip()) or automatic
+        backend = self.backends[mux]
+        inside = self.inside(mux)
+        if isinstance(backend, Herdr) and not inside:
+            err = backend.start_server()
+            if err:
+                self.say(err, warn=True)
+                return
+        # Ask again, so that a session made since the last refresh counts.
+        group = backend.load(inside)
+        if group.error:
+            self.say(group.error, warn=True)
+            return
+        existing = next((s for s in group.sessions if s.name == name), None)
+        if existing:
+            if existing.current and inside:
+                self.result = Exit(0)
+                return
+            self.execute(backend.switch_session(existing, inside))
+        else:
+            self.execute(backend.create(name, directory, inside))
+
+    def rename(self, s: Session, typed: str) -> None:
+        new = sanitize_name(typed.strip())
+        if not new or new == s.name:
+            return
+        if self.run_steps(self.backends[s.mux].rename(s, new)):
+            if s.mux == "zellij":
+                self.wanted[SESSIONS] = ("session", "zellij", new)
+            s.name = new
+            self.say(f"Renamed to {new}.")
+            self.start_load(s.mux)
+
+    def kill(self, s: Session) -> None:
+        if self.run_steps(self.backends[s.mux].kill(s)):
+            group = self.groups[s.mux]
+            group.sessions = [x for x in group.sessions if x.key != s.key]
+            group.agents = [a for a in group.agents if a.session_key != s.key]
+            self.clamp()
+            self.say(f"{'Deleted' if s.exited else 'Killed'} {s.name}.")
+            self.start_load(s.mux)
+
+    # ------------------------------------------------------------ input
+
+    def handle(self, ev: Event) -> None:
+        before = list(self.cursor)
+        self.dispatch(ev)
+        for w in (SESSIONS, AGENTS):
+            self.touched[w] = self.touched[w] or self.cursor[w] != before[w]
+
+    def dispatch(self, ev: Event) -> None:
+        if ev.kind == "mouse":
+            self.mouse(ev.button, ev.x, ev.y)
+            return
+        k = ev.key
+        if k == "ctrl+c":
+            self.result = Exit(0)
+            return
+        if self.mode:
+            self.dialog_key(k)
+            return
+        self.list_key(k)
+
+    def list_key(self, k: str) -> None:
+        w = self.focus
+        n = len(self.items(w))
+        if k in ("j", "down"):
+            self.cursor[w] = min(n - 1, self.cursor[w] + 1)
+        elif k in ("k", "up"):
+            self.cursor[w] = max(0, self.cursor[w] - 1)
+        elif k in ("alt+j", "alt+down", "alt+k", "alt+up"):
+            self.cursor[w] = jump_group(
+                self.items(w), self.cursor[w], 1 if k in ("alt+j", "alt+down") else -1
+            )
+        elif k in ("g", "home"):
+            self.cursor[w] = 0
+        elif k in ("G", "end"):
+            self.cursor[w] = max(0, n - 1)
+        elif k == "tab":
+            self.focus = AGENTS if w == SESSIONS else SESSIONS
+        elif k == "enter":
+            row = self.selected()
+            if row:
+                self.switch(row)
+        elif k == "/":
+            self.mode, self.input = "filter", self.filter
+        elif k == "?":
+            self.mode = "help"
+        elif k == "n":
+            row = self.selected()
+            self.new_mux = row.mux if row else self.ctx.listed[0]
+            self.mode, self.input = "new", ""
+        elif k in ("r", "x"):
+            self.session_dialog(k)
+        elif k == "ctrl+l":
+            self.redraw_all = True
+            self.refresh()
+        elif k in ("q", "esc"):
+            if k == "esc" and self.filter:
+                self.filter = ""
+            else:
+                self.result = Exit(0)
+
+    def session_dialog(self, k: str) -> None:
+        row = self.selected()
+        if not row or not row.session:
+            self.say(
+                "Rename and kill work on sessions. Press Tab to go to the Sessions list.",
+                warn=True,
+            )
+        elif k == "r" and row.session.exited:
+            self.say("An exited zellij session cannot be renamed.", warn=True)
+        else:
+            self.target = row
+            self.mode = "rename" if k == "r" else "kill"
+            self.input = row.session.name if k == "r" else ""
+
+    def dialog_key(self, k: str) -> None:
+        mode = self.mode
+        if mode == "help":
+            self.mode = None
+            return
+        if mode == "kill":
+            self.mode = None
+            if k in ("y", "Y", "enter") and self.target and self.target.session:
+                self.kill(self.target.session)
+            return
+        if k == "esc":
+            if mode == "filter":
+                self.filter = ""
+            self.mode, self.input = None, ""
+            return
+        if mode == "new" and k == "tab":
+            listed = self.ctx.listed
+            self.new_mux = listed[(listed.index(self.new_mux) + 1) % len(listed)]
+            return
+        if k in ("enter", "up", "down"):
+            value, self.mode, self.input = self.input, None, ""
+            if mode == "rename" and self.target and self.target.session:
+                if k == "enter":
+                    self.rename(self.target.session, value)
+            elif mode == "new":
+                if k == "enter":
+                    self.create(self.new_mux, value)
+            elif k != "enter":
+                self.list_key(k)
+            return
+        if k == "backspace":
+            self.input = self.input[:-1]
+        elif k == "ctrl+u":
+            self.input = ""
+        elif k == "ctrl+w":
+            self.input = re.sub(r"\S*\s*$", "", self.input)
+        elif len(k) == 1 and k.isprintable():
+            self.input += k
+        if mode == "filter":
+            self.filter, self.cursor = self.input, [0, 0]
+
+    def mouse(self, button: int, x: int, y: int) -> None:
+        if self.mode:
+            if self.mode == "help":
+                self.mode = None
+            return
+        if button in (64, 65):
+            for h in self.hits:
+                if h.index < 0 and h.y0 <= y < h.y1 and h.x0 <= x < h.x1:
+                    self.focus = h.which
+            n = len(self.items(self.focus))
+            d = -1 if button == 64 else 1
+            self.cursor[self.focus] = max(0, min(n - 1, self.cursor[self.focus] + d))
+            return
+        if button == 0:
+            for h in self.hits:
+                if h.index >= 0 and h.y0 == y and h.x0 <= x < h.x1:
+                    again = self.focus == h.which and self.cursor[h.which] == h.index
+                    self.focus, self.cursor[h.which] = h.which, h.index
+                    if again:
+                        self.list_key("enter")
+                    return
+
+    def render(self, cols: int, rows: int) -> list[str]:
+        return self.view.render(cols, rows)
+
+
+# ---------------------------------------------------------------- view
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+class View:
+    """Paints the app's state as exactly rows lines of cols cells, and
+    records where the rows are for the mouse."""
+
+    def __init__(self, app: App) -> None:
+        self.app = app
+        self.frame = 0
+
+    def render(self, cols: int, rows: int) -> list[str]:
+        app = self.app
+        app.hits = []
+        app.clamp()
+        self.frame = int(time.monotonic() * 10)
+        dim = 0.55 if app.mode in ("rename", "new", "kill", "help") else 0.0
+        Canvas.theme = Theme(app.options.dark, dim)
+        Canvas.paint_bg = app.options.paint_bg
+        t = Canvas.theme
+        if cols < MIN_COLS or rows < MIN_ROWS:
+            text = f"Make the window at least {MIN_COLS}×{MIN_ROWS}."
+            msg = paint(" " * max(0, (cols - len(text)) // 2) + text, t.subtle)
+            blank = fit("", cols)
+            top = (rows - 1) // 2
+            return [blank] * top + [fit(msg, cols)] + [blank] * (rows - top - 1)
+
+        h = rows - 2
+        wide = cols >= PREVIEW_MIN_COLS
+        lw = max(34, min(46, cols * 2 // 5)) if wide else cols
+        sh = max(4, (h * 11 + 19) // 20)
+        body = self.list_panel(SESSIONS, "Sessions", 0, 1, lw, sh)
+        body += self.list_panel(AGENTS, "Agents", 0, 1 + sh, lw, h - sh)
+        if wide:
+            body = [
+                left + right for left, right in zip(body, self.preview(cols - lw, h))
+            ]
+        lines = [self.header(cols)] + body + [self.footer(cols)]
+
+        if dim:
+            Canvas.theme = Theme(app.options.dark)
+            dialog = self.dialog(cols)
+            x0 = max(0, (cols - width(dialog[0])) // 2)
+            y0 = max(1, (rows - len(dialog)) // 2 - 1)
+            for i, d in enumerate(dialog):
+                if y0 + i < rows:
+                    lines[y0 + i] = overlay(lines[y0 + i], x0, d)
+        return lines
+
+    def header(self, cols: int) -> str:
+        app, t = self.app, Canvas.theme
+        pill = gradient(" ◇ multiplexer dashboard ", t.iris, t.rose, t.base)
+        groups = paint(" › ", t.muted).join(
+            paint(g, t.mux(g), bold=True) for g in app.ctx.listed
+        )
+        left = pill + paint("  " + app.ctx.label + "   ", t.subtle) + groups
+        n_s = sum(len(g.sessions) for g in app.groups.values())
+        n_a = sum(len(g.agents) for g in app.groups.values())
+        right = (
+            paint(plural(n_s, "session"), t.text)
+            + paint(" · ", t.muted)
+            + paint(plural(n_a, "agent") + " ", t.gold)
+        )
+        return lr(left, right, cols)
+
+    def panel(
+        self,
+        title: str,
+        extra: str,
+        note: str,
+        body: list[str],
+        w: int,
+        h: int,
+        focused: bool,
+    ) -> list[str]:
+        t = Canvas.theme
+        bc = t.iris if focused else t.hl_high
+
+        def border(s: str) -> str:
+            return paint(s, bc)
+
+        if focused:
+            chip = paint(f" {title} ", t.base, t.iris, bold=True)
+        else:
+            chip = paint(f" {title} ", t.subtle, bold=True)
+        room = w - 6 - width(chip)
+        if extra and width(extra) > room:
+            extra = cut(extra, 0, max(0, room - 1)) + paint("…", t.muted)
+        top = border("╭─") + chip + extra
+        top += border("─" * max(0, w - width(top) - 1) + "╮")
+        out = [fit(top, w)]
+        for i in range(h - 2):
+            out.append(
+                border("│") + fit(body[i] if i < len(body) else "", w - 2) + border("│")
+            )
+        tag = paint(f" {note} ", t.muted) if note else ""
+        out.append(
+            fit(border("╰" + "─" * max(0, w - 3 - width(tag))) + tag + border("─╯"), w)
+        )
+        return out
+
+    def list_panel(
+        self, which: int, title: str, x: int, y: int, w: int, h: int
+    ) -> list[str]:
+        app, t = self.app, Canvas.theme
+        rows = app.rows(which)
+        items = items_of(rows)
+        focused = app.focus == which
+        sel = items[app.cursor[which]] if items else None
+        ih, iw = h - 2, w - 2
+        cursor_row = next((i for i, r in enumerate(rows) if r is sel), None)
+        start = app.offset[which] = scroll_offset(
+            rows, cursor_row, app.offset[which], ih
+        )
+        app.hits.append(Hit(which, -1, y, y + h, x, x + w))
+        body = []
+        index = {id(r): i for i, r in enumerate(items)}
+        for r in rows[start : start + ih]:
+            if r.kind == "group":
+                body.append(self.group_row(r, which, iw))
+                continue
+            is_sel = r is sel
+            if is_sel and focused:
+                pen = Pen(t.hl_med)
+            elif is_sel:
+                pen = Pen(t.hl_low)
+            else:
+                pen = Pen()
+            accent = pen("▌", t.iris) if is_sel and focused else pen(" ")
+            if r.session:
+                line = self.session_row(r.session, iw - 1, pen, is_sel)
+            elif r.agent:
+                line = self.agent_row(r.agent, iw - 1, pen, is_sel)
+            else:
+                line = ""
+            app.hits.append(
+                Hit(which, index[id(r)], y + 1 + len(body), 0, x + 1, x + 1 + iw)
+            )
+            body.append(accent + line)
+        if not rows:
+            if app.filter:
+                text = f"  no match for “{app.filter}”"
+            elif which == AGENTS and any(g.loading for g in app.groups.values()):
+                text = "  loading…"
+            else:
+                text = "  no agents" if which == AGENTS else "  no sessions"
+            body = ["", paint(text, t.muted, italic=True)]
+        note = f"{app.cursor[which] + 1}/{len(items)}" if items else ""
+        return self.panel(title, "", note, body, w, h, focused)
+
+    def group_row(self, r: Row, which: int, w: int) -> str:
+        t = Canvas.theme
+        name = paint(" " + r.mux + " ", t.mux(r.mux), bold=True)
+        if r.note == "loading…":
+            tail = paint(f" {SPINNER[self.frame % len(SPINNER)]} loading ", t.muted)
+        elif r.note:
+            tail = paint(f" {r.note} ", t.love)
+        elif r.count == 0 and which == SESSIONS:
+            tail = paint(" no sessions ", t.muted, italic=True)
+        else:
+            tail = paint(f" {r.count} ", t.muted)
+        room = w - width(name)
+        if width(tail) > room:
+            tail = fit(tail, room)
+        return name + paint("─" * max(0, room - width(tail)), t.hl_med) + tail
+
+    def session_row(self, s: Session, w: int, pen: Pen, is_sel: bool) -> str:
+        t = Canvas.theme
+        mark = pen("● ", t.love) if s.current else pen("  ")
+        if s.exited:
+            name = pen(s.name, t.muted, italic=True)
+        else:
+            name = pen(s.name, t.text, bold=s.current or is_sel)
+        left = pen(" ") + mark + name
+        if s.attached and not s.current and w >= 40:
+            left += pen(" attached", t.muted)
+        if s.exited:
+            right = pen(f"exited {s.age} ", t.muted, italic=True)
+        else:
+            agents = self.app.agents_of(s)
+            blocked = any(a.status == "blocked" for a in agents)
+            right = (
+                pen(f"◆{len(agents)} ", t.love if blocked else t.gold, bold=blocked)
+                if agents
+                else ""
+            )
+            if w >= 32:
+                unit = "win" if s.mux == "tmux" else "tab"
+                right += pen(f"{plural(s.tabs, unit):<6} ", t.muted)
+        return lr(left, right, w, pen)
+
+    def status(self, a: Agent, pen: Pen, wide: bool) -> str:
+        t = Canvas.theme
+        st = a.status
+        if st == "working":
+            glyph, color, bold = SPINNER[self.frame % len(SPINNER)], t.gold, False
+        elif st == "blocked":
+            # Pulses, since it waits for the user.
+            glyph, bold = "●", True
+            color = t.love if (self.frame // 6) % 2 == 0 else mix(t.love, t.base, 0.45)
+        elif st == "idle":
+            glyph, color, bold = "○", t.foam, False
+        elif st == "done":
+            glyph, color, bold = "✓", t.pine, False
+        else:
+            return ""
+        return pen(f"{glyph} {st} " if wide else f"{glyph} ", color, bold=bold)
+
+    def agent_row(self, a: Agent, w: int, pen: Pen, is_sel: bool) -> str:
+        t = Canvas.theme
+        c = t.agent(a.name)
+        blocked = a.status == "blocked"
+        left = (
+            pen(" ")
+            + pen("◆ ", t.love if blocked else c)
+            + pen(f"{a.name:<9}", c, bold=is_sel or blocked)
+            + pen(a.session, t.text)
+            + pen(" › " + a.tab, t.muted)
+        )
+        # The status keeps its word when the row has room for it.
+        status = self.status(a, pen, True)
+        if width(left) + width(status) >= w:
+            status = self.status(a, pen, False)
+        return lr(left, status, w, pen)
+
+    def preview(self, w: int, h: int) -> list[str]:
+        app, t = self.app, Canvas.theme
+        row = app.selected()
+        sep = paint(" › ", t.muted)
+        extra, note, info = "", "", ""
+        screen: list[str] = []
+        if row and row.agent:
+            a = row.agent
+            extra = (
+                paint(" " + a.mux, t.mux(a.mux), bold=True)
+                + sep
+                + paint(a.session, t.text)
+                + sep
+                + paint(a.tab, t.subtle)
+                + " "
+            )
+            note = "pane " + a.pane
+            info = paint(a.name, t.agent(a.name), bold=True)
+            if a.path:
+                info += paint(" · " + self.short_path(a.path), t.subtle)
+            st = self.status(a, Pen(), True)
+            if st:
+                info += paint(" · ", t.muted) + st
+        elif row and row.session:
+            s = row.session
+            extra = (
+                paint(" " + s.mux, t.mux(s.mux), bold=True)
+                + sep
+                + paint(s.name, t.text)
+                + " "
+            )
+            if s.exited:
+                info = paint(f"exited {s.age} ago", t.muted, italic=True)
+                screen = [
+                    "",
+                    paint("This session has exited.", t.subtle),
+                    paint("Enter resurrects it; x deletes it.", t.muted),
+                ]
+            else:
+                unit = "window" if s.mux == "tmux" else "tab"
+                parts = [self.short_path(s.path)] if s.path else []
+                parts.append(plural(s.tabs, unit))
+                if s.created:
+                    parts.append("up " + format_age(time.time() - s.created))
+                info = paint(" · ", t.muted).join(paint(p, t.subtle) for p in parts)
+                note = "focused pane"
+        if row and not (row.session and row.session.exited):
+            key = item_key(row)
+            p = app.previews.get(key)
+            if p and p.error:
+                screen = ["", paint(p.error, t.love)]
+            elif p:
+                screen = p.lines
+            elif key in app.capturing:
+                screen = ["", paint("capturing…", t.muted, italic=True)]
+        body: list[str] = []
+        if row:
+            room = h - 4
+            shown = screen[-room:] if room > 0 else []
+            body = [" " + info, paint("─" * (w - 2), t.hl_med)]
+            body += [" " + raw(cut(line, 0, w - 3)) for line in shown]
+        return self.panel("Preview", extra, note, body, w, h, False)
+
+    def short_path(self, path: str) -> str:
+        home = self.app.env.get("HOME") or ""
+        if home and (path == home or path.startswith(home.rstrip("/") + "/")):
+            return "~" + path[len(home.rstrip("/")) :]
+        return path
+
+    def footer(self, cols: int) -> str:
+        app, t = self.app, Canvas.theme
+        if app.mode == "filter":
+            left = (
+                paint(" / ", t.base, t.gold, bold=True)
+                + paint(" " + app.input, t.text)
+                + paint(" ", bg=t.text)
+                + paint("   enter keep · esc clear", t.muted)
+            )
+            n = len(app.items(SESSIONS)) + len(app.items(AGENTS))
+            return lr(
+                left,
+                paint(f"{plural(n, 'match').replace('matchs', 'matches')} ", t.muted),
+                cols,
+            )
+        if app.toast:
+            text, warn, _ = app.toast
+            if warn:
+                icon = paint(" ! ", t.base, t.love, bold=True)
+            else:
+                icon = paint(" → ", t.base, t.pine, bold=True)
+            return fit(icon + paint(" " + text, t.love if warn else t.text), cols)
+        keys = [
+            ("↵", "switch"),
+            ("⇥", "lists"),
+            ("/", "filter"),
+            ("n", "new"),
+            ("r", "rename"),
+            ("x", "kill"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+        right = paint(f"/{app.filter} ", t.gold, bold=True) if app.filter else ""
+        left = ""
+        for k, v in keys:
+            piece = paint(f" {k} ", t.text, t.overlay, bold=True) + paint(
+                f" {v}  ", t.muted
+            )
+            if width(left) + width(piece) > cols - width(right) - 1:
+                break
+            left += piece
+        return lr(" " + left, right, cols)
+
+    # ------------------------------------------------------------ dialogs
+
+    def dialog(self, cols: int) -> list[str]:
+        app, t = self.app, Canvas.theme
+        pen = Pen(t.surface)
+        dw = min(64, cols - 4)
+        iw = dw - 4
+        caret = paint(" ", bg=t.iris)
+
+        def key(k: str, label: str, bg: RGB = t.overlay, fg: RGB = t.text) -> str:
+            return (
+                pen(" ")
+                + paint(f" {k} ", fg, bg, bold=True)
+                + pen(f" {label} ", t.subtle)
+            )
+
+        def text_field(value: str) -> str:
+            v = value[-max(1, iw - 4) :]
+            return (
+                paint(" " + v, t.text, t.overlay)
+                + caret
+                + paint(" " * max(0, iw - 2 - width(v)), bg=t.overlay)
+            )
+
+        accent = t.iris
+        lines: list[str]
+        target = app.target.session if app.target else None
+        if app.mode == "rename" and target:
+            title = "Rename session"
+            lines = [
+                "",
+                pen(target.mux, t.mux(target.mux), bold=True)
+                + pen(" › ", t.muted)
+                + pen(target.name, t.text),
+                "",
+                text_field(app.input),
+                "",
+                key("enter", "rename") + key("esc", "cancel"),
+            ]
+        elif app.mode == "new":
+            mux = app.new_mux
+            directory, automatic = app.new_session_dir(mux)
+            title = "New session"
+            lines = [
+                "",
+                pen("in ", t.subtle)
+                + pen(mux, t.mux(mux), bold=True)
+                + pen("  " + self.short_path(directory), t.muted),
+                "",
+                text_field(app.input),
+                pen(f"empty: {automatic}", t.muted, italic=True),
+                "",
+                key("enter", "create") + key("esc", "cancel"),
+            ]
+            if len(app.ctx.listed) > 1:
+                lines[-1] += key("tab", "multiplexer")
+        elif app.mode == "kill" and target:
+            accent = t.love
+            verb = "Delete" if target.exited else "Kill"
+            title = f"{verb} session"
+            agents = app.agents_of(target)
+            lines = [
+                "",
+                pen(f"{verb} ", t.text)
+                + pen(target.mux, t.mux(target.mux), bold=True)
+                + pen(" session ", t.text)
+                + pen(target.name, t.text, bold=True)
+                + pen("?", t.text),
+            ]
+            if agents:
+                names = ", ".join(a.name for a in agents)
+                stop = "stops" if len(agents) == 1 else "stop"
+                lines.append(
+                    pen(
+                        f"Its {plural(len(agents), 'agent')} ({names}) {stop} with it.",
+                        t.love,
+                    )
+                )
+            if target.current:
+                lines.append(pen("This is the session you are in.", t.love))
+            lines += ["", key("y", verb.lower(), t.love, t.base) + key("n", "cancel")]
+        else:
+            title = "Keys"
+            rows = [
+                ("j k ↑ ↓", "move"),
+                ("g G", "first / last (also Home End)"),
+                ("alt+j/k", "next / previous multiplexer"),
+                ("Tab", "sessions ⇄ agents"),
+                ("Enter", "switch to the session or agent"),
+                ("/", "filter as you type"),
+                ("n", "new session"),
+                ("r", "rename session"),
+                ("x", "kill session"),
+                ("ctrl+l", "refresh and redraw"),
+                ("mouse", "click selects, again switches"),
+                ("q Esc", "close"),
+            ]
+            lines = [""] + [
+                pen(f"{k:<9}", t.iris, bold=True) + pen(v, t.text) for k, v in rows
+            ]
+            lines += ["", pen("any key closes this", t.muted, italic=True)]
+
+        def border(s: str) -> str:
+            return paint(s, accent, t.surface)
+
+        chip = paint(f" {title} ", t.base, accent, bold=True)
+        out = [border("╭─") + chip + border("─" * max(0, dw - 4 - width(chip)) + "─╮")]
+        for line in lines:
+            out.append(
+                border("│") + pen(" ") + fit(line, iw, pen) + pen(" ") + border("│")
+            )
+        out.append(border("╰" + "─" * (dw - 2) + "╯"))
+        return out
+
+
+# ---------------------------------------------------------------- main
+
+
+def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="multiplexer-dashboard",
+        description="A fullscreen picker for tmux, zellij and herdr sessions and their coding agents.",
+    )
+    p.add_argument(
+        "--multiplexer",
+        choices=["tmux", "zellij", "herdr"],
+        help="list only this multiplexer",
+    )
+    p.add_argument("--client", help="the tmux client to switch (inside tmux)")
+    p.add_argument("--dir", help="the directory of new sessions")
+    p.add_argument("--theme", choices=["auto", "light", "dark"], default="auto")
+    p.add_argument(
+        "--no-bg", action="store_true", help="keep the terminal's own background"
+    )
+    # Internal: see zellij_focus_pane.
+    p.add_argument("--zellij-focus-pane", nargs=3, help=argparse.SUPPRESS)
+    return p.parse_args(argv)
+
+
+def run_app(app: App, term: Term, inbox: Inbox) -> None:
+    app.refresh()
+    while app.result is None:
+        now = time.monotonic()
+        for kind, key, value in inbox.drain():
+            app.receive(kind, key, value, now)
+        app.tick(now)
+        if app.redraw_all:
+            app.redraw_all = False
+            term.invalidate()
+        cols, rows = term.size()
+        term.draw(app.render(cols, rows))
+        for ev in term.events(app.timeout(time.monotonic())):
+            app.handle(ev)
+            if app.result is not None:
+                break
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.zellij_focus_pane:
+        return zellij_focus_pane(*args.zellij_focus_pane)
+    ctx = detect_context(os.environ, shutil.which, args.multiplexer)
+    if not ctx.listed:
+        print(
+            "multiplexer-dashboard: found none of zellij, herdr, or tmux",
+            file=sys.stderr,
+        )
+        return 1
+    inbox = Inbox()
+    try:
+        term = Term(inbox.read_fd)
+    except OSError as e:
+        print(
+            f"multiplexer-dashboard: cannot open the terminal: {e.strerror}",
+            file=sys.stderr,
+        )
+        return 1
+
+    def on_resize(*_: object) -> None:
+        term.resized = True
+        inbox.wake()
+
+    def on_exit(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGWINCH, on_resize)
+    signal.signal(signal.SIGTERM, on_exit)
+    signal.signal(signal.SIGHUP, on_exit)
+    try:
+        with term:
+            dark = {"light": False, "dark": True}.get(args.theme)
+            if dark is None:
+                dark = term.background_is_dark() is not False
+            options = Options(args.client, args.dir, dark, not args.no_bg)
+            app = App(ctx, options, run_command, os.environ, inbox)
+            run_app(app, term, inbox)
+    except KeyboardInterrupt:
+        return 130
+    result = app.result or Exit(0)
+    plan = result.plan
+    if plan and plan.attach:
+        try:
+            if plan.cwd:
+                os.chdir(plan.cwd)
+            if plan.helper:
+                subprocess.Popen(
+                    plan.helper,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            sys.stdout.flush()
+            os.execvp(plan.attach[0], plan.attach)
+        except OSError as e:
+            print(
+                f"multiplexer-dashboard: {plan.attach[0]}: {e.strerror}",
+                file=sys.stderr,
+            )
+            return 1
+    return result.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
