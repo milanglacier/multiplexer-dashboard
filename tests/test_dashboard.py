@@ -1007,8 +1007,38 @@ class ScreenTest(unittest.TestCase):
         self.assertLess(text.index("zellij ─"), text.index("tmux ─"))
         self.assertIn("● monopi", text)
         self.assertIn("exited", text)
-        self.assertIn("✻ claude   dotfiles › main", text)
+        self.assertIn("✻ claude dotfiles › main", text)
+        self.assertIn("◎ codex  dotfiles › docs", text)
         self.assertIn("?  help", lines[-1])
+
+    def test_agent_names_line_up_with_the_widest(self):
+        app = self.app()
+        app.groups["tmux"].agents.append(
+            md.Agent("tmux", "~", "$0", "w", 0, "%9", "cursor-agent")
+        )
+        text = "\n".join(plain(line) for line in app.render(120, 30))
+        self.assertIn("➤ cursor-agent ~ › w", text)
+        self.assertIn("✻ claude       dotfiles › main", text)
+
+    def test_agent_name_column_has_a_cap(self):
+        app = self.app()
+        app.groups["tmux"].agents.append(
+            md.Agent("tmux", "~", "$0", "w", 0, "%9", "a-very-long-agent-name")
+        )
+        text = "\n".join(plain(line) for line in app.render(120, 30))
+        self.assertIn("◇ a-very-long-a… ~ › w", text)
+        self.assertIn("✻ claude         dotfiles › main", text)
+
+    def test_filter_keeps_the_agent_name_column(self):
+        app = self.app()
+        app.filter = "claude"
+        text = "\n".join(plain(line) for line in app.render(120, 30))
+        self.assertIn("✻ claude dotfiles › main", text)
+        app.groups["tmux"].agents[0] = md.Agent(
+            "tmux", "monopi", "$1", "pi", 2, "%7", "opencode"
+        )
+        text = "\n".join(plain(line) for line in app.render(120, 30))
+        self.assertIn("✻ claude   dotfiles › main", text)
 
     def test_narrow_hides_the_preview(self):
         app = self.app()

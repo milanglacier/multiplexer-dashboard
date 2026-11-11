@@ -765,6 +765,9 @@ AGENT_ICONS = {
     "copilot": "⊙",
 }
 DEFAULT_AGENTS = tuple(AGENT_ICONS)
+# The widest agent name the agents list shows in full. A longer name ends
+# with "…".
+MAX_AGENT_NAME_WIDTH = 14
 # The icon of any other agent, such as one named in
 # MULTIPLEXER_DASHBOARD_AGENTS or one that herdr reports.
 CUSTOM_AGENT_ICON = "◇"
@@ -2299,6 +2302,7 @@ class View:
         app.hits.append(Hit(which, -1, y, y + h, x, x + w))
         body = []
         index = {id(r): i for i, r in enumerate(items)}
+        name_w = self.agent_name_width()
         for r in rows[start : start + ih]:
             if r.kind == "group":
                 body.append(self.group_row(r, which, iw))
@@ -2314,7 +2318,7 @@ class View:
             if r.session:
                 line = self.session_row(r.session, iw - 1, pen, is_sel)
             elif r.agent:
-                line = self.agent_row(r.agent, iw - 1, pen, is_sel)
+                line = self.agent_row(r.agent, iw - 1, pen, is_sel, name_w)
             else:
                 line = ""
             app.hits.append(
@@ -2393,14 +2397,24 @@ class View:
             color = t.muted
         return pen(f"{glyph} {st} " if wide else f"{glyph} ", color, bold=bold)
 
-    def agent_row(self, a: Agent, w: int, pen: Pen, is_sel: bool) -> str:
+    def agent_name_width(self) -> int:
+        """The width of the agent name column: the widest name of all
+        agents, ignoring the filter so that the column stays put while the
+        user types, and at most MAX_AGENT_NAME_WIDTH."""
+        names = [a.name for g in self.app.groups.values() for a in g.agents]
+        return min(max(map(width, names), default=0), MAX_AGENT_NAME_WIDTH)
+
+    def agent_row(self, a: Agent, w: int, pen: Pen, is_sel: bool, name_w: int) -> str:
         t = Canvas.theme
         c = t.agent(a.name)
         blocked = a.status == "blocked"
+        # A space always separates the name from the session.
+        name = fit(pen(a.name, c, bold=is_sel or blocked), name_w, pen)
         left = (
             pen(" ")
             + pen(agent_icon(a.name) + " ", t.love if blocked else c)
-            + pen(f"{a.name:<9}", c, bold=is_sel or blocked)
+            + name
+            + pen(" ")
             + pen(a.session, t.text)
             + pen(" › " + a.tab, t.muted)
         )
