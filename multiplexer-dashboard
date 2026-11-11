@@ -2227,10 +2227,7 @@ class View:
     def header(self, cols: int) -> str:
         app, t = self.app, Canvas.theme
         pill = gradient(" ◇ multiplexer dashboard ", t.iris, t.rose, t.base)
-        groups = paint(" › ", t.muted).join(
-            paint(g, t.mux(g), bold=True) for g in app.ctx.listed
-        )
-        left = pill + paint("  " + app.ctx.label + "   ", t.subtle) + groups
+        left = pill + paint("  " + app.ctx.label, t.subtle)
         n_s = sum(len(g.sessions) for g in app.groups.values())
         n_a = sum(len(g.agents) for g in app.groups.values())
         right = (
