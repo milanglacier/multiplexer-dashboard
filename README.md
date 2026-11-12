@@ -150,19 +150,22 @@ start it again.
 
 ## Keys
 
-| Key             | Action                             |
-| --------------- | ---------------------------------- |
-| `j` `k` `↑` `↓` | move                               |
-| `Alt+j` `Alt+k` | next / previous multiplexer        |
-| `Tab`           | switch between sessions and agents |
-| `Enter`         | go to the session or agent         |
-| `/`             | filter as you type                 |
-| `n` `r` `x`     | new / rename / kill session        |
-| `?`             | show every key                     |
-| `q` `Escape`    | close                              |
+| Key             | Action                                 |
+| --------------- | -------------------------------------- |
+| `j` `k` `↑` `↓` | move                                   |
+| `Alt+j` `Alt+k` | next / previous multiplexer            |
+| `h` `l` `←` `→` | hide / show the session's tabs         |
+| `H` `L`         | hide / show the tabs of every session  |
+| `Tab`           | switch between sessions and agents     |
+| `Enter`         | go to the session, tab or agent        |
+| `/`             | filter as you type                     |
+| `n` `r` `x`     | new / rename / kill session            |
+| `?`             | show every key                         |
+| `q` `Escape`    | close                                  |
 
-The mouse works too: click to select, click again to go there, and scroll
-to move.
+A session's tabs (tmux windows, zellij tabs or herdr tabs) show indented
+under it, and the filter also matches their names. The mouse works too:
+click to select, click again to go there, and scroll to move.
 
 <details>
 <summary>Options and details</summary>
@@ -170,7 +173,7 @@ to move.
 ```
 multiplexer-dashboard [--multiplexer tmux|zellij|herdr] [--client CLIENT]
                       [--dir DIR] [--theme auto|light|dark] [--no-bg]
-                      [--sidebar]
+                      [--sidebar] [--tabs collapsed|expanded]
 ```
 
 - `--multiplexer` lists only one multiplexer.
@@ -184,6 +187,9 @@ multiplexer-dashboard [--multiplexer tmux|zellij|herdr] [--client CLIENT]
 - `--sidebar` shows only the lists, and inside a multiplexer stays open
   after a switch. See [Keep it open in a sidebar](#keep-it-open-in-a-sidebar).
   herdr has a sidebar of its own, and in herdr Escape does nothing.
+- `--tabs expanded` starts with the tabs of every session shown. The
+  default, `--tabs collapsed`, starts with them hidden. Either way, `h`,
+  `l`, `H` and `L` change it.
 
 Inside a multiplexer the dashboard lists only that multiplexer, or each one
 it runs in when they are nested. herdr workspaces appear as sessions, and

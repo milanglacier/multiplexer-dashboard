@@ -271,6 +271,9 @@ EOF
     herdr pane report-agent --source e2e --agent pi --state blocked "$hone_pane" >/dev/null
     workspace_id() { herdr workspace list | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l) | .workspace_id'; }
     focused_workspace() { herdr workspace list | jq -r '.result.workspaces[] | select(.focused) | .label'; }
+    # A second tab in hone, which stays in the background.
+    htab_id=$(herdr tab create --workspace "$(workspace_id hone)" --label htab | jq -r .result.tab.tab_id)
+    active_tab() { herdr workspace list | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l) | .active_tab_id'; }
 fi
 
 # ---------------------------------------------------------------- outside
@@ -337,6 +340,29 @@ click $w 6 "$row"
 eventually "the attached tmux client is in beta" beta tm list-clients -F '#{session_name}'
 t kill-window -t $w
 
+zclients() { zellij --session "$1" action list-clients 2>/dev/null | awk 'NR > 1 { print $2 }'; }
+# zclient_tab SESSION: the tab of the focused pane of the session's client.
+zclient_tab() {
+    local pane
+    pane=$(zclients "$1" | head -1)
+    zellij --session "$1" action list-panes -j 2>/dev/null |
+        jq -r --arg p "$pane" '.[] | select("terminal_\(.id)" == $p and (.is_plugin | not)) | .tab_name'
+}
+
+step "outside: Enter on a tmux window attaches to it"
+open_outside twin
+w=e2e:twin
+# alpha's active window is the first one, and the filter shows its window
+# named agent.
+filter $w agent
+wait_for $w "1 agent" >/dev/null
+t send-keys -t $w j Enter
+eventually "the tmux client is on alpha's agent window" "alpha agent" \
+    tm list-clients -F '#{session_name} #{window_name}'
+t kill-window -t $w
+# The later checks attach to alpha and wait for the shell's prompt.
+tm select-window -t alpha:0
+
 step "outside: Enter on a tmux agent attaches to its pane"
 open_outside tagent
 filter e2e:tagent gemini
@@ -356,6 +382,15 @@ if have zellij; then
     eventually "the zellij client is on the codex pane" "$codex_pane" \
         sh -c 'zellij --session zone action list-clients | awk "NR > 1 { print \$2 }"'
     t kill-window -t e2e:zagent
+
+    step "outside: Enter on a zellij tab attaches to it"
+    open_outside ztab
+    w=e2e:ztab
+    filter $w code
+    wait_for $w "1 code" >/dev/null
+    t send-keys -t $w j Enter
+    eventually "the zellij client is on the code tab" code zclient_tab zone
+    t kill-window -t $w
 else
     skip "zellij not installed"
 fi
@@ -398,6 +433,18 @@ filter e2e:tin amp
 t send-keys -t e2e:tin Tab Enter
 eventually "the client is on the amp pane" "$amp_pane" tm display -p -c "$client" '#{pane_id}'
 
+step "inside tmux: l shows a session's windows, and Enter on one switches to it"
+tm select-window -t alpha:0
+t send-keys -t e2e:tin M-d
+wait_for e2e:tin "in tmux" >/dev/null
+filter e2e:tin alpha
+t send-keys -t e2e:tin l
+wait_for e2e:tin "1 agent" && echo "ok: l shows the windows"
+t send-keys -t e2e:tin j j
+wait_for e2e:tin "▌     1 agent" >/dev/null
+t send-keys -t e2e:tin Enter
+eventually "the client is on the agent window" agent tm display -p -c "$client" '#{window_name}'
+
 step "inside tmux: without --client, tmux switches the calling client"
 t send-keys -t e2e:tin M-e
 wait_for e2e:tin "in tmux" >/dev/null
@@ -427,8 +474,6 @@ t kill-window -t e2e:tother
 
 # ---------------------------------------------------------------- zellij
 
-zclients() { zellij --session "$1" action list-clients 2>/dev/null | awk 'NR > 1 { print $2 }'; }
-
 if have zellij; then
     step "inside zellij: only zellij, switching sessions"
     t new-window -d -t e2e -n zin "clean zellij attach zone"
@@ -457,6 +502,28 @@ if have zellij; then
         jq -r '.[] | select(.pane_command // "" | startswith("claude")) | "terminal_\(.id)"')
     eventually "the client is on the claude pane" "$claude_pane" zclients zone
 
+    step "inside zellij: Enter on a tab of another session"
+    t send-keys -t e2e:zin M-d
+    wait_for e2e:zin "in zellij" >/dev/null
+    filter e2e:zin ztwo
+    t send-keys -t e2e:zin Enter
+    eventually "the client switched to ztwo" 1 sh -c 'zellij --session ztwo action list-clients | awk "NR > 1" | wc -l'
+    t send-keys -t e2e:zin M-d
+    wait_for e2e:zin "in zellij" >/dev/null
+    # zone was left on its first tab, code.
+    filter e2e:zin second
+    wait_for e2e:zin "2 second" >/dev/null
+    t send-keys -t e2e:zin j Enter
+    eventually "the client is on zone's second tab" second zclient_tab zone
+
+    step "inside zellij: Enter on another tab of the current session"
+    t send-keys -t e2e:zin M-d
+    wait_for e2e:zin "in zellij" >/dev/null
+    filter e2e:zin code
+    wait_for e2e:zin "1 code" >/dev/null
+    t send-keys -t e2e:zin j Enter
+    eventually "the client is on zone's code tab" code zclient_tab zone
+
     step "inside zellij: Enter on an exited session resurrects it"
     t send-keys -t e2e:zin M-d
     wait_for e2e:zin "in zellij" >/dev/null
@@ -483,6 +550,16 @@ if have herdr; then
     t send-keys -t e2e:hin Enter
     eventually "herdr focused hone" hone focused_workspace
     wait_gone e2e:hin "in herdr" && echo "ok: the popup closed"
+
+    step "inside herdr: Enter on a tab focuses it"
+    t send-keys -t e2e:hin C-b
+    sleep 0.3
+    t send-keys -t e2e:hin M-d
+    wait_for e2e:hin "in herdr" >/dev/null
+    filter e2e:hin htab
+    wait_for e2e:hin "2 htab" >/dev/null
+    t send-keys -t e2e:hin j Enter
+    eventually "herdr focused hone's second tab" "$htab_id" active_tab hone
     t kill-window -t e2e:hin
 fi
 

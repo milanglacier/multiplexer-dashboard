@@ -208,8 +208,35 @@ class TmuxTest(unittest.TestCase):
         group = md.Tmux(runner, {}).load(inside=False)
         self.assertEqual((group.sessions, group.error), ([], None))
 
+    def test_windows_as_tabs(self):
+        group, _ = self.load()
+        tabs = [
+            (t.session, t.id, t.index, t.name, t.active, t.pane, t.panes)
+            for t in group.tabs
+        ]
+        self.assertEqual(
+            tabs,
+            [
+                ("~", "@0", 0, "codex", False, "%0", 1),
+                ("~", "@1", 1, "btop", True, "%1", 1),
+                ("monopi", "@2", 0, "bash", False, "%2", 1),
+                ("monopi", "@3", 1, "claude", True, "%3", 2),
+                ("with space", "@4", 0, "bash", True, "%5", 1),
+            ],
+        )
+        self.assertEqual([a.tab_id for a in group.agents], ["@0", "@3", "@3"])
+        # The dashboard's own pane is never a tab's focused pane.
+        runner = FakeRunner(
+            {
+                ("tmux", "list-sessions"): fixture("tmux/list-sessions.txt"),
+                ("tmux", "list-panes"): fixture("tmux/list-panes.txt"),
+            }
+        )
+        group = md.Tmux(runner, {"TMUX_PANE": "%3"}).load(inside=True)
+        self.assertEqual(group.tabs[3].pane, "%4")
+
     def test_ps_runs_only_for_interpreter_panes(self):
-        panes = "$0\t0\tzsh\t1\t1\t0\t%0\tclaude\t100\t/home/me\n"
+        panes = "$0\t@0\t0\tzsh\t1\t1\t0\t%0\tclaude\t100\t/home/me\n"
         runner = FakeRunner(
             {
                 ("tmux", "list-sessions"): "~\t$0\t1\t1\t0\t/home/me\n",
@@ -259,7 +286,7 @@ class ZellijTest(unittest.TestCase):
 
     def test_panes(self):
         s = md.Session("zellij", "zdots2")
-        agents = md.parse_zellij_panes(
+        agents, _ = md.parse_zellij_panes(
             s,
             fixture("zellij/list-panes.json"),
             fixture("zellij/list-tabs.json"),
@@ -291,6 +318,53 @@ class ZellijTest(unittest.TestCase):
         )
         self.assertEqual(s.pane, "terminal_0")
 
+    def test_tabs(self):
+        s = md.Session("zellij", "zdots2")
+        _, tabs = md.parse_zellij_panes(
+            s,
+            fixture("zellij/list-panes.json"),
+            fixture("zellij/list-tabs.json"),
+            NAMES,
+        )
+        self.assertEqual(
+            [(t.id, t.index, t.name, t.active, t.pane, t.panes) for t in tabs],
+            [
+                ("0", 1, "Tab #1", False, "terminal_3", 3),
+                # A tab of a background session can have no panes yet.
+                ("1", 2, "second", False, "", 0),
+            ],
+        )
+        self.assertEqual({(t.session, t.session_key) for t in tabs}, {("zdots2",) * 2})
+        self.assertEqual(tabs[0].path, "/home/me/proj/plain")
+        # The active tab gives the session its pane, and each tab has its
+        # own focused pane.
+        tabs_json = (
+            '[{"position": 0, "name": "a", "active": false, "tab_id": 0},'
+            ' {"position": 1, "name": "b", "active": true, "tab_id": 5}]'
+        )
+        panes_json = (
+            '[{"id": 1, "tab_id": 0, "is_focused": true},'
+            ' {"id": 2, "tab_id": 5, "is_focused": false},'
+            ' {"id": 3, "tab_id": 5, "is_focused": true}]'
+        )
+        _, tabs = md.parse_zellij_panes(s, panes_json, tabs_json, NAMES)
+        self.assertEqual(
+            [(t.pane, t.active) for t in tabs],
+            [
+                ("terminal_1", False),
+                ("terminal_3", True),
+            ],
+        )
+        self.assertEqual(s.pane, "terminal_3")
+
+    def test_tabs_from_the_panes_without_list_tabs(self):
+        s = md.Session("zellij", "zdots2")
+        _, tabs = md.parse_zellij_panes(
+            s, fixture("zellij/list-panes.json"), None, NAMES
+        )
+        self.assertEqual([(t.id, t.index, t.name) for t in tabs], [("0", 1, "Tab #1")])
+        self.assertEqual(s.tabs, 1)
+
     def test_load(self):
         runner = FakeRunner(
             {
@@ -307,6 +381,7 @@ class ZellijTest(unittest.TestCase):
         group = md.Zellij(runner, env).load(inside=True)
         self.assertEqual([s.current for s in group.sessions], [True, False])
         self.assertEqual(len(group.agents), 2)
+        self.assertEqual([t.name for t in group.tabs], ["Tab #1", "second"])
         # The exited session is not asked for its panes.
         self.assertFalse(any("zplain" in c for c in runner.calls))
 
@@ -352,6 +427,17 @@ class ZellijTest(unittest.TestCase):
             ],
         )
 
+    def test_focus_after_attach_stops_at_the_tab_without_a_pane(self):
+        calls = []
+
+        def runner(args, timeout=5.0):
+            calls.append(args[4:])
+            out = "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n1 terminal_0 N/A\n"
+            return md.Result(0, out if args[4] == "list-clients" else "", "")
+
+        self.assertEqual(md.zellij_focus_pane("zc", "3", "", runner), 0)
+        self.assertEqual(calls, [["list-clients"], ["go-to-tab-by-id", "3"]])
+
 
 # ---------------------------------------------------------------- herdr
 
@@ -393,6 +479,18 @@ class HerdrTest(unittest.TestCase):
                 ("gemini", "plain", "1", "w2:p1", "idle"),
             ],
         )
+
+    def test_tabs(self):
+        tabs = self.parse().tabs
+        self.assertEqual(
+            [(t.session, t.id, t.index, t.label, t.active, t.pane) for t in tabs],
+            [
+                ("repo-a", "w1:t1", 1, "1", True, "w1:p1"),
+                ("repo-a", "w1:t2", 2, "2 build", False, "w1:p2"),
+                ("plain", "w2:t1", 1, "1", True, "w2:p1"),
+            ],
+        )
+        self.assertEqual(tabs[1].path, "/home/me/proj/repo-a")
 
     def test_server_not_running(self):
         err = md.Result(1, "", fixture("herdr/server-not-running.txt"))
@@ -466,21 +564,64 @@ def groups():
     tmux = md.Group(
         "tmux",
         [md.Session("tmux", "~", id="$0"), md.Session("tmux", "monopi", id="$1")],
-        [md.Agent("tmux", "monopi", "$1", "pi", 2, "%7", "pi")],
+        [md.Agent("tmux", "monopi", "$1", "pi", 2, "%7", "pi", tab_id="@2")],
+        [
+            md.Tab("tmux", "$0", "~", "@0", 0, "zsh", True, "%0"),
+            md.Tab("tmux", "$1", "monopi", "@1", 0, "zsh", True, "%1"),
+            md.Tab("tmux", "$1", "monopi", "@2", 2, "pi", False, "%7"),
+        ],
     )
     zellij = md.Group(
         "zellij",
         [md.Session("zellij", "dotfiles"), md.Session("zellij", "old", exited=True)],
         [
             md.Agent(
-                "zellij", "dotfiles", "dotfiles", "main", 0, "terminal_2", "claude"
+                "zellij",
+                "dotfiles",
+                "dotfiles",
+                "main",
+                0,
+                "terminal_2",
+                "claude",
+                tab_id="0",
             ),
             md.Agent(
-                "zellij", "dotfiles", "dotfiles", "docs", 1, "terminal_5", "codex"
+                "zellij",
+                "dotfiles",
+                "dotfiles",
+                "docs",
+                1,
+                "terminal_5",
+                "codex",
+                tab_id="1",
+            ),
+        ],
+        [
+            md.Tab(
+                "zellij", "dotfiles", "dotfiles", "0", 1, "main", True, "terminal_2"
+            ),
+            md.Tab(
+                "zellij", "dotfiles", "dotfiles", "1", 2, "docs", False, "terminal_5"
             ),
         ],
     )
     return [zellij, tmux]
+
+
+def row_names(rows):
+    """Each row as its kind and name: a group's count, a session's name or a
+    tab's label."""
+    out = []
+    for r in rows:
+        if r.session:
+            out.append(("session", r.session.name))
+        elif r.tab:
+            out.append(("tab", r.tab.label))
+        elif r.agent:
+            out.append(("agent", r.agent.name))
+        else:
+            out.append(("group", r.count))
+    return out
 
 
 class RowsTest(unittest.TestCase):
@@ -509,6 +650,67 @@ class RowsTest(unittest.TestCase):
         self.assertEqual(names("dotf"), ["claude", "codex"])
         self.assertEqual(names("docs"), ["codex"])
         self.assertEqual(md.build_rows(groups(), md.AGENTS, "nothing"), [])
+
+    def test_expanded_sessions_show_their_tabs(self):
+        rows = md.build_rows(groups(), md.SESSIONS, "", lambda s: s.name == "dotfiles")
+        self.assertEqual(
+            row_names(rows),
+            [
+                ("group", 2),
+                ("session", "dotfiles"),
+                ("tab", "1 main"),
+                ("tab", "2 docs"),
+                ("session", "old"),
+                ("group", 2),
+                ("session", "~"),
+                ("session", "monopi"),
+            ],
+        )
+        rows = md.build_rows(groups(), md.SESSIONS, "", lambda s: True)
+        # An exited session has no tabs.
+        self.assertEqual(
+            row_names(rows),
+            [
+                ("group", 2),
+                ("session", "dotfiles"),
+                ("tab", "1 main"),
+                ("tab", "2 docs"),
+                ("session", "old"),
+                ("group", 2),
+                ("session", "~"),
+                ("tab", "0 zsh"),
+                ("session", "monopi"),
+                ("tab", "0 zsh"),
+                ("tab", "2 pi"),
+            ],
+        )
+        self.assertEqual(md.item_key(rows[2]), ("tab", "zellij", "dotfiles", "0"))
+
+    def test_filter_matches_tab_names(self):
+        def names(q, expanded):
+            rows = md.build_rows(groups(), md.SESSIONS, q, lambda s: expanded)
+            return row_names(rows)
+
+        # The session name matches: an expanded session shows all its tabs.
+        self.assertEqual(names("mono", False), [("group", 1), ("session", "monopi")])
+        self.assertEqual(
+            names("mono", True),
+            [("group", 1), ("session", "monopi"), ("tab", "0 zsh"), ("tab", "2 pi")],
+        )
+        # Only a tab name matches: the session shows with that tab.
+        for expanded in (False, True):
+            self.assertEqual(
+                names("doc", expanded),
+                [("group", 1), ("session", "dotfiles"), ("tab", "2 docs")],
+            )
+        # Both match: a collapsed session shows the matching tab.
+        self.assertEqual(
+            names("pi", False), [("group", 1), ("session", "monopi"), ("tab", "2 pi")]
+        )
+        self.assertEqual(
+            names("pi", True),
+            [("group", 1), ("session", "monopi"), ("tab", "0 zsh"), ("tab", "2 pi")],
+        )
 
     def test_empty_loading_and_failing_groups(self):
         g = [
@@ -622,6 +824,176 @@ class CursorTest(unittest.TestCase):
         self.assertEqual(result.code, 0)
 
 
+class TabsTest(unittest.TestCase):
+    def app(self, **options):
+        app = make_app(**options)
+        for g in groups():
+            app.set_group(g)
+        return app
+
+    def keys(self, app, *ks):
+        for k in ks:
+            app.handle(md.Event("key", k))
+
+    def names(self, app):
+        return row_names(app.items(md.SESSIONS))
+
+    def selected(self, app):
+        return row_names([app.selected()])[0]
+
+    def test_l_shows_and_h_hides_the_tabs(self):
+        app = self.app()
+        self.keys(app, "l")
+        self.assertEqual(
+            self.names(app)[:4],
+            [
+                ("session", "dotfiles"),
+                ("tab", "1 main"),
+                ("tab", "2 docs"),
+                ("session", "old"),
+            ],
+        )
+        self.assertEqual(self.selected(app), ("session", "dotfiles"))
+        self.keys(app, "j", "j")
+        self.assertEqual(self.selected(app), ("tab", "2 docs"))
+        # h on a tab row hides the tabs and goes to the session.
+        self.keys(app, "h")
+        self.assertEqual(self.selected(app), ("session", "dotfiles"))
+        self.assertEqual(self.names(app)[1], ("session", "old"))
+        # The arrows do the same.
+        self.keys(app, "right")
+        self.assertEqual(self.names(app)[1], ("tab", "1 main"))
+        self.keys(app, "left")
+        self.assertEqual(self.names(app)[1], ("session", "old"))
+
+    def test_l_keeps_the_cursor_on_a_later_session(self):
+        app = self.app()
+        self.keys(app, "G", "l")
+        self.assertEqual(self.selected(app), ("session", "monopi"))
+        self.assertEqual(self.names(app)[-2:], [("tab", "0 zsh"), ("tab", "2 pi")])
+
+    def test_sessions_without_tabs_and_the_agents_list(self):
+        app = self.app()
+        self.keys(app, "j", "l")
+        self.assertEqual(app.expanded, {})
+        self.keys(app, "tab", "l", "L")
+        self.assertEqual((app.expanded, app.tabs_default), ({}, False))
+        self.assertEqual(app.selected().agent.name, "claude")
+
+    def test_H_and_L_change_every_session(self):
+        app = self.app()
+        self.keys(app, "l", "j", "L")
+        # L keeps the cursor on its tab row and overrides h and l.
+        self.assertEqual(self.selected(app), ("tab", "1 main"))
+        self.assertEqual(len(self.names(app)), 9)
+        # A session that appears later follows L.
+        tmux = groups()[1]
+        tmux.sessions.append(md.Session("tmux", "late", id="$9"))
+        tmux.tabs.append(md.Tab("tmux", "$9", "late", "@9", 0, "vim", True, "%9"))
+        app.set_group(tmux)
+        self.assertEqual(self.names(app)[-2:], [("session", "late"), ("tab", "0 vim")])
+        self.keys(app, "H")
+        self.assertEqual(self.selected(app), ("session", "dotfiles"))
+        self.assertEqual(len(self.names(app)), 5)
+
+    def test_the_state_survives_a_refresh(self):
+        app = self.app()
+        self.keys(app, "l", "j", "j")
+        app.set_group(groups()[0])
+        app.set_group(groups()[1])
+        self.assertEqual(self.selected(app), ("tab", "2 docs"))
+        self.assertEqual(self.names(app)[2], ("tab", "2 docs"))
+
+    def test_a_zellij_rename_keeps_the_state(self):
+        app = self.app()
+        self.keys(app, "l")
+        app.rename(app.selected().session, "dots")
+        self.assertEqual(app.expanded, {("zellij", "dots"): True})
+        zellij = groups()[0]
+        zellij.sessions[0].name = "dots"
+        for t in zellij.tabs:
+            t.session_key = t.session = "dots"
+        app.set_group(zellij)
+        self.assertEqual(self.names(app)[:2], [("session", "dots"), ("tab", "1 main")])
+
+    def test_tabs_option(self):
+        self.assertEqual(md.parse_args([]).tabs, "collapsed")
+        self.assertEqual(md.parse_args(["--tabs", "collapsed"]).tabs, "collapsed")
+        self.assertEqual(md.parse_args(["--tabs", "expanded"]).tabs, "expanded")
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            md.parse_args(["--tabs", "open"])
+        self.assertEqual(len(self.names(self.app())), 4)
+        app = self.app(expand_tabs=True)
+        self.assertEqual(len(self.names(app)), 9)
+        # h and l still work.
+        self.keys(app, "h")
+        self.assertEqual(self.names(app)[1], ("session", "old"))
+
+    def test_rename_and_kill_on_a_tab_row(self):
+        runner = FakeRunner()
+        app = make_app(runner=runner)
+        for g in groups():
+            app.set_group(g)
+        self.keys(app, "l", "j", "r")
+        self.assertIsNone(app.mode)
+        self.assertEqual(
+            app.toast[:2],
+            ("Rename and kill work on sessions. Press h to go to the session.", True),
+        )
+        self.keys(app, "x")
+        self.assertIsNone(app.mode)
+        self.assertEqual(runner.calls, [])
+
+    def test_render_tab_rows_under_the_session_name(self):
+        for cols, sidebar in ((160, False), (24, True)):
+            app = self.app(sidebar=sidebar)
+            app.handle(md.Event("key", "l"))
+            lines = [plain(line) for line in app.render(cols, 30)]
+            self.assertEqual({md.width(line) for line in app.render(cols, 30)}, {cols})
+            # The selected row, which is the session.
+            session = next(line for line in lines if "▌" in line)
+            tab = next(line for line in lines if "1 main" in line)
+            self.assertEqual(tab.index("1 main"), session.index("dotfiles") + 2)
+            # The tab's agent count is on the right.
+            self.assertIn("◆1", tab)
+
+    def test_a_narrow_tab_row_cuts_the_name_first(self):
+        app = self.app(sidebar=True)
+        app.groups["zellij"].tabs[0].name = "a-very-long-tab-name"
+        app.handle(md.Event("key", "l"))
+        tab = next(
+            plain(line) for line in app.render(24, 30) if "a-very" in plain(line)
+        )
+        self.assertIn("…", tab)
+        self.assertIn("◆1", tab)
+
+    def test_preview_of_a_tab(self):
+        app = self.app()
+        app.groups["zellij"].tabs[1].path = "/home/me/docs"
+        app.groups["zellij"].tabs[1].panes = 2
+        self.keys(app, "l", "j", "j")
+        row = app.selected()
+        pane, session = app.preview_target(row)
+        self.assertEqual((pane, session.name), ("terminal_5", "dotfiles"))
+        app.previews[md.item_key(row)] = md.Preview(
+            app.generation["zellij"], ["docs pane"]
+        )
+        text = "\n".join(plain(line) for line in app.render(120, 30))
+        self.assertIn("zellij › dotfiles › 2 docs", text)
+        self.assertIn("~/docs · 2 panes", text)
+        self.assertIn("docs pane", text)
+        # tmux needs no session to capture a pane.
+        self.keys(app, "G", "L", "G")
+        self.assertEqual(app.preview_target(app.selected()), ("%7", None))
+
+    def test_help_lists_the_tab_keys(self):
+        app = self.app()
+        self.keys(app, "?")
+        text = "\n".join(plain(line) for line in app.render(120, 30))
+        self.assertIn("hide or show the session's tabs", text)
+        self.assertIn("hide or show every session's tabs", text)
+
+
 # ---------------------------------------------------------------- actions
 
 
@@ -661,6 +1033,16 @@ class CommandsTest(unittest.TestCase):
             t.rename(s, "x").steps, [["tmux", "rename-session", "-t", "$1", "x"]]
         )
         self.assertEqual(t.kill(s).steps, [["tmux", "kill-session", "-t", "$1"]])
+        tab = md.Tab("tmux", "$1", "monopi", "@4", 2, "pi")
+        self.assertEqual(
+            t.switch_tab(tab, True, None).steps,
+            [["tmux", "switch-client", "-c", "/dev/pts/3", "-t", "@4"]],
+        )
+        outside = t.switch_tab(tab, False, None)
+        self.assertEqual(
+            (outside.steps, outside.attach),
+            ([], ["tmux", "attach-session", "-t", "@4"]),
+        )
         # Without --client, tmux picks the client.
         plain_tmux = md.Tmux(FakeRunner(), {})
         self.assertEqual(
@@ -718,6 +1100,24 @@ class CommandsTest(unittest.TestCase):
         self.assertEqual(z.kill(s).steps, [["zellij", "kill-session", "dots"]])
         self.assertEqual(z.kill(gone).steps, [["zellij", "delete-session", "old"]])
 
+    def test_zellij_tabs(self):
+        z = md.Zellij(FakeRunner(), {})
+        tab = md.Tab("zellij", "dots", "dots", "7", 3, "logs")
+        self.assertEqual(
+            z.switch_tab(tab, True, "dots").steps,
+            [["zellij", "action", "go-to-tab-by-id", "7"]],
+        )
+        self.assertEqual(
+            z.switch_tab(tab, True, "other").steps,
+            [["zellij", "action", "switch-session", "dots", "--tab-position", "3"]],
+        )
+        outside = z.switch_tab(tab, False, None)
+        self.assertEqual(outside.attach, ["zellij", "attach", "dots"])
+        self.assertEqual(
+            outside.helper,
+            [sys.executable, md.SCRIPT, "--zellij-focus-pane", "dots", "7", ""],
+        )
+
     def test_herdr(self):
         h = md.Herdr(FakeRunner(), {})
         s = md.Session("herdr", "repo", id="w1")
@@ -751,6 +1151,16 @@ class CommandsTest(unittest.TestCase):
             h.rename(s, "x").steps, [["herdr", "workspace", "rename", "w1", "x"]]
         )
         self.assertEqual(h.kill(s).steps, [["herdr", "workspace", "close", "w1"]])
+        tab = md.Tab("herdr", "w1", "repo", "w1:t2", 2, "build")
+        inside = h.switch_tab(tab, True, None)
+        self.assertEqual(
+            (inside.steps, inside.attach), ([["herdr", "tab", "focus", "w1:t2"]], None)
+        )
+        outside = h.switch_tab(tab, False, None)
+        self.assertEqual(
+            (outside.steps, outside.attach),
+            ([["herdr", "tab", "focus", "w1:t2"]], ["herdr"]),
+        )
 
 
 class ActionsTest(unittest.TestCase):
@@ -786,6 +1196,19 @@ class ActionsTest(unittest.TestCase):
         app.groups["tmux"].sessions[0].current = True
         app.handle(md.Event("key", "enter"))
         self.assertEqual((runner.calls, app.result.code), ([], 0))
+
+    def test_enter_on_a_tab(self):
+        app, runner = self.app()
+        app.handle(md.Event("key", "G"))
+        app.handle(md.Event("key", "l"))
+        app.handle(md.Event("key", "G"))
+        app.handle(md.Event("key", "enter"))
+        self.assertEqual(runner.calls, [["tmux", "switch-client", "-t", "@2"]])
+        self.assertEqual(app.result.code, 0)
+        app, runner = self.app(inside=())
+        for k in ["G", "l", "G", "enter"]:
+            app.handle(md.Event("key", k))
+        self.assertEqual(app.result.plan.attach, ["tmux", "attach-session", "-t", "@2"])
 
     def test_click_selects_and_a_second_click_switches(self):
         app, runner = self.app()
@@ -1266,6 +1689,18 @@ class SidebarTest(unittest.TestCase):
         )
         self.assertIsNone(app.result)
         self.assertEqual(app.toast[0], "Switched to claude in dotfiles.")
+
+    def test_enter_on_a_tab_of_the_current_session(self):
+        app, runner = self.app()
+        app.groups["zellij"].sessions[0].current = True
+        self.keys(app, "l", "j", "enter")
+        # The active tab holds the sidebar: Enter goes back.
+        back = ["zellij", "action", "focus-last-pane"]
+        self.assertEqual(runner.calls, [back])
+        self.keys(app, "j", "enter")
+        self.assertEqual(runner.calls[-1], ["zellij", "action", "go-to-tab-by-id", "1"])
+        self.assertIsNone(app.result)
+        self.assertEqual(app.toast[0], "Switched to docs in dotfiles.")
 
     def test_escape_and_the_current_session_go_back(self):
         app, runner = self.app()

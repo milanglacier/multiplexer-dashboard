@@ -5,13 +5,18 @@ agents that run in them.
 Usage: multiplexer-dashboard [--multiplexer tmux|zellij|herdr]
                              [--client CLIENT] [--dir DIR]
                              [--theme auto|light|dark] [--no-bg]
-                             [--sidebar]
+                             [--sidebar] [--tabs collapsed|expanded]
 
 The left column lists sessions above agents, both grouped by multiplexer in
-the order zellij, tmux, herdr. The right side previews the selected
-session's focused pane or the selected agent's pane, in that pane's own
-colors. Enter switches to the selected session or jumps to the selected
-agent's pane, and the dashboard then exits.
+the order zellij, tmux, herdr. A session can show its tabs (tmux windows,
+zellij tabs or herdr tabs) indented under it. The right side previews the
+focused pane of the selected session or tab, or the selected agent's pane,
+in that pane's own colors. Enter switches to the selected session or tab or
+jumps to the selected agent's pane, and the dashboard then exits.
+
+The tabs are hidden at start, or shown with --tabs expanded. h and l hide
+and show the tabs of the selected session, and H and L those of every
+session. The filter matches session names and tab names.
 
 Inside a multiplexer, found from the environment variables TMUX, ZELLIJ and
 HERDR_ENV=1, the dashboard lists only that multiplexer, or each one it runs
@@ -56,9 +61,10 @@ hidden pane asks its multiplexer every 3 seconds whether it is on screen
 again.
 
 Keys: j/k or the arrows move, g/G or Home/End jump to the ends, Alt+j/k or
-Alt+arrows jump between multiplexers, Tab switches lists, Enter switches,
-/ filters, n creates, r renames, x kills, Ctrl+L refreshes, ? shows every
-key, and q or Escape quits. A click selects a row, a second click switches,
+Alt+arrows jump between multiplexers, h/l or the left and right arrows hide
+and show tabs, H/L hide and show all tabs, Tab switches lists, Enter
+switches, / filters, n creates, r renames, x kills, Ctrl+L refreshes, ?
+shows every key, and q or Escape quits. A click selects a row, a second click switches,
 and the wheel moves the cursor.
 """
 
@@ -761,18 +767,47 @@ class Agent:
     name: str
     path: str = ""
     status: str | None = None
-    # The zellij or herdr tab id.
+    # The tab's id, the same as Tab.id.
     tab_id: str = ""
 
 
 @dataclass
+class Tab:
+    """A tmux window, a zellij tab or a herdr tab."""
+
+    mux: str
+    session_key: str
+    session: str
+    # The tmux window id (such as "@3"), the zellij tab id or the herdr tab
+    # id.
+    id: str
+    # The number that the multiplexer's own tab bar shows.
+    index: int
+    name: str
+    active: bool = False
+    # The tab's focused pane, for the preview, and that pane's directory.
+    pane: str = ""
+    path: str = ""
+    panes: int = 0
+
+    @property
+    def label(self) -> str:
+        """The tab's number and name, or only the number when the name is
+        the number, as herdr names its tabs by default."""
+        if self.name in ("", str(self.index)):
+            return str(self.index)
+        return f"{self.index} {self.name}"
+
+
+@dataclass
 class Group:
-    """What one multiplexer reports: its sessions and agents, or why it
-    failed. A group is loading until its first answer arrives."""
+    """What one multiplexer reports: its sessions, their tabs and agents, or
+    why it failed. A group is loading until its first answer arrives."""
 
     mux: str
     sessions: list[Session] = field(default_factory=list)
     agents: list[Agent] = field(default_factory=list)
+    tabs: list[Tab] = field(default_factory=list)
     error: str | None = None
     loading: bool = False
 
@@ -907,14 +942,15 @@ TMUX_SESSION_FORMAT = (
     "#{session_attached}\t#{session_path}"
 )
 TMUX_PANE_FORMAT = (
-    "#{session_id}\t#{window_index}\t#{window_name}\t#{window_active}\t"
-    "#{pane_active}\t#{pane_last}\t#{pane_id}\t#{pane_current_command}\t"
-    "#{pane_pid}\t#{pane_current_path}"
+    "#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t"
+    "#{window_active}\t#{pane_active}\t#{pane_last}\t#{pane_id}\t"
+    "#{pane_current_command}\t#{pane_pid}\t#{pane_current_path}"
 )
 
 
 class TmuxPane(NamedTuple):
     session_id: str
+    window_id: str
     window_index: int
     window_name: str
     window_active: bool
@@ -961,20 +997,21 @@ def parse_tmux_panes(text: str) -> list[TmuxPane]:
     panes = []
     for line in text.splitlines():
         f = line.split("\t")
-        if len(f) != 10:
+        if len(f) != 11:
             continue
         panes.append(
             TmuxPane(
                 f[0],
-                to_int(f[1]),
-                f[2],
-                f[3] == "1",
+                f[1],
+                to_int(f[2]),
+                f[3],
                 f[4] == "1",
                 f[5] == "1",
-                f[6],
+                f[6] == "1",
                 f[7],
-                to_int(f[8]),
-                f[9],
+                f[8],
+                to_int(f[9]),
+                f[10],
             )
         )
     return panes
@@ -988,26 +1025,47 @@ def tmux_snapshot(
     current_id: str | None,
     own_pane: str = "",
 ) -> Group:
-    """Joins the sessions and panes: each session gets its focused pane and
-    that pane's directory, and each agent pane becomes an agent. When the
-    dashboard's own pane (own_pane) is the focused one, the pane that was
-    focused before it counts instead."""
+    """Joins the sessions and panes: each window becomes a tab, each session
+    gets the focused pane of its active window and that pane's directory,
+    and each agent pane becomes an agent. A window's focused pane is its
+    active pane; when that is the dashboard's own pane (own_pane), the pane
+    that was active before it counts instead."""
     by_id = {s.id: s for s in sessions}
     order = {s.id: i for i, s in enumerate(sessions)}
-    for s in sessions:
-        s.current = s.id == current_id
-        window = [
-            p
-            for p in panes
-            if p.session_id == s.id and p.window_active and p.pane_id != own_pane
-        ]
+    windows: dict[tuple[str, str], list[TmuxPane]] = {}
+    for p in panes:
+        if p.session_id in by_id:
+            windows.setdefault((p.session_id, p.window_id), []).append(p)
+    tabs = []
+    for (sid, wid), in_window in windows.items():
+        s, first = by_id[sid], in_window[0]
+        others = [p for p in in_window if p.pane_id != own_pane]
         focused = (
-            next((p for p in window if p.pane_active), None)
-            or next((p for p in window if p.pane_last), None)
-            or (window[0] if window else None)
+            next((p for p in others if p.pane_active), None)
+            or next((p for p in others if p.pane_last), None)
+            or (others[0] if others else None)
+        )
+        tab = Tab(
+            "tmux",
+            s.id,
+            s.name,
+            wid,
+            first.window_index,
+            first.window_name,
+            first.window_active,
+            panes=len(in_window),
         )
         if focused:
-            s.pane, s.path = focused.pane_id, focused.path or s.path
+            tab.pane, tab.path = focused.pane_id, focused.path
+        tabs.append(tab)
+    tabs.sort(key=lambda t: (order[t.session_key], t.index))
+    for s in sessions:
+        s.current = s.id == current_id
+        active = next(
+            (t for t in tabs if t.session_key == s.id and t.active and t.pane), None
+        )
+        if active:
+            s.pane, s.path = active.pane, active.path or s.path
     agents = []
     for p in panes:
         s = by_id.get(p.session_id)
@@ -1027,12 +1085,13 @@ def tmux_snapshot(
                     p.pane_id,
                     name,
                     p.path,
+                    tab_id=p.window_id,
                 )
             )
     agents.sort(
         key=lambda a: (order[a.session_key], a.tab_index, to_int(a.pane.lstrip("%")))
     )
-    return Group("tmux", sessions, agents)
+    return Group("tmux", sessions, agents, tabs)
 
 
 def parse_tmux_visible(text: str) -> bool | None:
@@ -1105,6 +1164,12 @@ class Tmux:
         if inside:
             return Plan([["tmux", "switch-client", *self.client_args(), "-t", a.pane]])
         return Plan(attach=["tmux", "attach-session", "-t", a.pane])
+
+    def switch_tab(self, tab: Tab, inside: bool, current: str | None) -> Plan:
+        # A window id target selects the window's session and the window.
+        if inside:
+            return Plan([["tmux", "switch-client", *self.client_args(), "-t", tab.id]])
+        return Plan(attach=["tmux", "attach-session", "-t", tab.id])
 
     def create(self, name: str, directory: str, inside: bool) -> Plan:
         if inside:
@@ -1217,38 +1282,62 @@ def parse_zellij_panes(
     tabs_json: str | None,
     names: frozenset[str],
     own_pane: str = "",
-) -> list[Agent]:
+) -> tuple[list[Agent], list[Tab]]:
     """Fills in a session's tab count, focused pane and directory from
     `action list-panes -a -j` and `action list-tabs -j -s`, and returns its
-    agents. The focused pane is one of the active tab's, a tiled one before
-    a floating one, and never the dashboard's own pane (own_pane)."""
+    agents and tabs. A tab's focused pane is a tiled one before a floating
+    one, and never the dashboard's own pane (own_pane). The session's
+    focused pane is the active tab's, or the first tab's when no client
+    makes a tab active. Without list-tabs, the tabs come from the panes."""
     panes = json.loads(panes_json)
-    tabs: list[dict[str, Any]] = []
+    raw_tabs: list[dict[str, Any]] = []
     if tabs_json:
         try:
-            tabs = json.loads(tabs_json)
+            raw_tabs = json.loads(tabs_json)
         except ValueError:
-            tabs = []
+            raw_tabs = []
+    if not raw_tabs:
+        by_id: dict[Any, dict[str, Any]] = {}
+        for p in panes:
+            by_id.setdefault(
+                p.get("tab_id"),
+                {
+                    "tab_id": p.get("tab_id"),
+                    "position": p.get("tab_position") or 0,
+                    "name": p.get("tab_name") or "",
+                },
+            )
+        raw_tabs = list(by_id.values())
     terminals = [p for p in panes if not p.get("is_plugin") and not p.get("exited")]
     # A background session can have tabs without panes.
-    s.tabs = len(tabs) or len({p.get("tab_id") for p in panes})
-    active = next((t.get("tab_id") for t in tabs if t.get("active")), None)
-    if active is None:
-        positions = sorted(
-            ((p.get("tab_position", 0), p.get("tab_id")) for p in terminals),
-            key=lambda x: x[0],
+    s.tabs = len(raw_tabs)
+    tabs = []
+    for t in sorted(raw_tabs, key=lambda t: t.get("position") or 0):
+        in_tab = [p for p in terminals if p.get("tab_id") == t.get("tab_id")]
+        candidates = [p for p in in_tab if f"terminal_{p['id']}" != own_pane]
+        candidates.sort(
+            key=lambda p: (not p.get("is_focused"), bool(p.get("is_floating")))
         )
-        active = positions[0][1] if positions else None
-    in_tab = [
-        p
-        for p in terminals
-        if p.get("tab_id") == active and f"terminal_{p['id']}" != own_pane
-    ]
-    in_tab.sort(key=lambda p: (not p.get("is_focused"), bool(p.get("is_floating"))))
-    focused = in_tab[0] if in_tab else None
+        tab = Tab(
+            "zellij",
+            s.name,
+            s.name,
+            str(t.get("tab_id", "")),
+            int(t.get("position") or 0) + 1,
+            str(t.get("name") or ""),
+            bool(t.get("active")),
+            panes=len(in_tab),
+        )
+        if candidates:
+            tab.pane = f"terminal_{candidates[0]['id']}"
+            tab.path = candidates[0].get("pane_cwd") or ""
+        tabs.append(tab)
+    with_panes = [t for t in tabs if t.pane]
+    focused = next((t for t in with_panes if t.active), None) or next(
+        iter(with_panes), None
+    )
     if focused:
-        s.pane = f"terminal_{focused['id']}"
-        s.path = focused.get("pane_cwd") or ""
+        s.pane, s.path = focused.pane, focused.path
     agents = []
     for p in terminals:
         command = p.get("pane_command") or p.get("terminal_command") or ""
@@ -1269,7 +1358,7 @@ def parse_zellij_panes(
                 )
             )
     agents.sort(key=lambda a: (a.tab_index, to_int(a.pane.split("_")[-1])))
-    return agents
+    return agents, tabs
 
 
 def zellij_status(pane: dict[str, Any]) -> str | None:
@@ -1320,10 +1409,11 @@ def zellij_focus_pane(
     session: str, tab_id: str, pane: str, runner: Runner = run_command
 ) -> int:
     """Waits up to 10 seconds for a client to attach to a session that had
-    none, then moves it to a pane. This runs in the background while an
-    attaching client replaces the dashboard. zellij's focus-pane-id does not
-    move a client when it comes from outside the session, but
-    go-to-tab-by-id and focus-next-pane move the session's first client."""
+    none, then moves it to a tab and a pane, or only to the tab when pane is
+    empty. This runs in the background while an attaching client replaces
+    the dashboard. zellij's focus-pane-id does not move a client when it
+    comes from outside the session, but go-to-tab-by-id and focus-next-pane
+    move the session's first client."""
     base = ["zellij", "--session", session, "action"]
 
     def clients() -> list[tuple[str, str]]:
@@ -1337,6 +1427,8 @@ def zellij_focus_pane(
         time.sleep(0.1)
     if tab_id:
         runner(base + ["go-to-tab-by-id", tab_id])
+    if not pane:
+        return 0
     for _ in range(64):
         if any(p == pane for _, p in clients()):
             return 0
@@ -1378,22 +1470,25 @@ class Zellij:
             )
 
         agents: list[Agent] = []
-        for s, (panes, tabs) in zip(
+        tabs: list[Tab] = []
+        for s, (panes, tabs_result) in zip(
             running, run_parallel([lambda s=s: details(s) for s in running])
         ):
             if panes.code != 0:
                 continue
             try:
-                tabs_json = tabs.out if tabs.code == 0 else None
+                tabs_json = tabs_result.out if tabs_result.code == 0 else None
                 own_pane = own if s.current else ""
-                agents += parse_zellij_panes(
+                session_agents, session_tabs = parse_zellij_panes(
                     s, panes.out, tabs_json, self.names, own_pane
                 )
+                agents += session_agents
+                tabs += session_tabs
                 if own_pane:
                     self.pane_tabs = zellij_pane_tabs(panes.out)
             except (ValueError, KeyError, TypeError):
                 continue
-        return Group("zellij", sessions, agents)
+        return Group("zellij", sessions, agents, tabs)
 
     def has_clients(self, session: str) -> bool:
         r = self.run(["zellij", "--session", session, "action", "list-clients"])
@@ -1415,6 +1510,30 @@ class Zellij:
             return Plan([["zellij", "action", "focus-pane-id", a.pane]])
         return Plan(
             [["zellij", "action", "switch-session", a.session, "--pane-id", a.pane]]
+        )
+
+    def switch_tab(self, tab: Tab, inside: bool, current: str | None) -> Plan:
+        if not inside:
+            helper = [sys.executable, SCRIPT, "--zellij-focus-pane"]
+            return Plan(
+                attach=["zellij", "attach", tab.session],
+                helper=helper + [tab.session, tab.id, ""],
+            )
+        if tab.session == current:
+            return Plan([["zellij", "action", "go-to-tab-by-id", tab.id]])
+        # --tab-position counts from 1, as the tab bar does, and not from 0
+        # as the tab positions that zellij lists do.
+        return Plan(
+            [
+                [
+                    "zellij",
+                    "action",
+                    "switch-session",
+                    tab.session,
+                    "--tab-position",
+                    str(tab.index),
+                ]
+            ]
         )
 
     def create(self, name: str, directory: str, inside: bool) -> Plan:
@@ -1481,15 +1600,30 @@ def parse_herdr(
     agents_json: str | None,
     inside: bool,
 ) -> Group:
-    """Workspaces as sessions, in workspace number order, and herdr's agents
-    with their status, from the JSON of `workspace list`, `tab list`, `pane
-    list` and `agent list`."""
+    """Workspaces as sessions, in workspace number order, their tabs, and
+    herdr's agents with their status, from the JSON of `workspace list`,
+    `tab list`, `pane list` and `agent list`. herdr marks only one focused
+    pane in all workspaces, so the pane of a session or a tab is that one
+    when it is in the tab, and else the tab's first pane. The preview then
+    asks herdr for the tab's focused pane."""
     workspaces = herdr_result(workspaces_json).get("workspaces") or []
     tabs = herdr_result(tabs_json).get("tabs") or [] if tabs_json else []
     panes = herdr_result(panes_json).get("panes") or [] if panes_json else []
     raw_agents = herdr_result(agents_json).get("agents") or [] if agents_json else []
     tab_by_id = {t.get("tab_id"): t for t in tabs}
+
+    def tab_pane(tab_id: Any) -> tuple[str, str]:
+        in_tab = [p for p in panes if p.get("tab_id") == tab_id]
+        pane = next(
+            (p for p in in_tab if p.get("focused")), in_tab[0] if in_tab else None
+        )
+        if not pane:
+            return "", ""
+        path = pane.get("foreground_cwd") or pane.get("cwd") or ""
+        return str(pane.get("pane_id")), str(path)
+
     sessions = []
+    active_tabs = {}
     for w in sorted(workspaces, key=lambda w: w.get("number") or 0):
         s = Session(
             "herdr",
@@ -1498,16 +1632,33 @@ def parse_herdr(
             tabs=int(w.get("tab_count") or 0),
             current=inside and bool(w.get("focused")),
         )
-        in_tab = [p for p in panes if p.get("tab_id") == w.get("active_tab_id")]
-        pane = next(
-            (p for p in in_tab if p.get("focused")), in_tab[0] if in_tab else None
-        )
-        if pane:
-            s.pane = str(pane.get("pane_id"))
-            s.path = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+        s.pane, s.path = tab_pane(w.get("active_tab_id"))
+        active_tabs[s.id] = w.get("active_tab_id")
         sessions.append(s)
     by_id = {s.id: s for s in sessions}
     order = {s.id: i for i, s in enumerate(sessions)}
+    session_tabs = []
+    for t in tabs:
+        s = by_id.get(t.get("workspace_id"))
+        if not s:
+            continue
+        number = int(t.get("number") or 0)
+        pane, path = tab_pane(t.get("tab_id"))
+        session_tabs.append(
+            Tab(
+                "herdr",
+                s.id,
+                s.name,
+                str(t.get("tab_id")),
+                number,
+                str(t.get("label") or number),
+                t.get("tab_id") == active_tabs[s.id],
+                pane,
+                path,
+                int(t.get("pane_count") or 0),
+            )
+        )
+    session_tabs.sort(key=lambda t: (order[t.session_key], t.index))
     agents = []
     for a in raw_agents:
         s = by_id.get(a.get("workspace_id"))
@@ -1535,7 +1686,7 @@ def parse_herdr(
             to_int(a.pane.rpartition(":p")[2]),
         )
     )
-    return Group("herdr", sessions, agents)
+    return Group("herdr", sessions, agents, session_tabs)
 
 
 class Herdr:
@@ -1604,6 +1755,12 @@ class Herdr:
             [["herdr", "agent", "focus", a.pane]], attach=None if inside else ["herdr"]
         )
 
+    def switch_tab(self, tab: Tab, inside: bool, current: str | None) -> Plan:
+        # Focusing a tab also focuses its workspace.
+        return Plan(
+            [["herdr", "tab", "focus", tab.id]], attach=None if inside else ["herdr"]
+        )
+
     def create(self, name: str, directory: str, inside: bool) -> Plan:
         return Plan(
             [
@@ -1629,8 +1786,8 @@ class Herdr:
 
     def capture(self, pane: str, s: Session | None) -> Result:
         if s is not None:
-            # The session's pane is one of its active tab; ask for the tab's
-            # focused pane.
+            # The pane of a session or a tab is one of the tab's panes; ask
+            # for the tab's focused pane.
             r = self.run(["herdr", "pane", "layout", "--pane", pane])
             if r.code == 0:
                 try:
@@ -1737,10 +1894,11 @@ def detect_context(
 
 @dataclass
 class Row:
-    kind: str  # "group", "session" or "agent"
+    kind: str  # "group", "session", "tab" or "agent"
     mux: str
     session: Session | None = None
     agent: Agent | None = None
+    tab: Tab | None = None
     count: int = 0
     note: str = ""
 
@@ -1748,34 +1906,65 @@ class Row:
 def item_key(row: Row) -> tuple[str, ...]:
     if row.session:
         return ("session", row.mux, row.session.key)
+    if row.tab:
+        return ("tab", row.mux, row.tab.session_key, row.tab.id)
     if row.agent:
         return ("agent", row.mux, row.agent.session_key, row.agent.pane)
     return ("group", row.mux)
 
 
-def build_rows(groups: Sequence[Group], which: int, query: str) -> list[Row]:
+def session_rows(
+    g: Group, q: str, expanded: Callable[[Session], bool]
+) -> tuple[list[Row], int]:
+    """The rows of a multiplexer's sessions and the number of sessions
+    among them. An expanded session is followed by its tabs. With a filter,
+    a session shows when its name or one of its tab names matches. An
+    expanded session whose name matches shows all its tabs, and any other
+    session shows the tabs whose names match."""
+    tabs: dict[str, list[Tab]] = {}
+    for t in g.tabs:
+        tabs.setdefault(t.session_key, []).append(t)
+    rows: list[Row] = []
+    count = 0
+    for s in g.sessions:
+        own = [] if s.exited else tabs.get(s.key, [])
+        name_matches = q in s.name.lower()
+        matching = [t for t in own if q and q in t.name.lower()]
+        if not name_matches and not matching:
+            continue
+        shown = own if expanded(s) and name_matches else matching
+        rows.append(Row("session", g.mux, session=s))
+        rows += [Row("tab", g.mux, tab=t) for t in shown]
+        count += 1
+    return rows, count
+
+
+def build_rows(
+    groups: Sequence[Group],
+    which: int,
+    query: str,
+    expanded: Callable[[Session], bool] = lambda s: False,
+) -> list[Row]:
     """The rows of a list: a header per multiplexer, then its matching
     items. Without a filter, the sessions list shows every multiplexer's
-    header, so that a loading, failing or empty one is still visible."""
+    header, so that a loading, failing or empty one is still visible.
+    expanded says whether a session shows its tabs."""
     q = query.lower()
     rows: list[Row] = []
     for g in groups:
         items: list[Row]
         if which == SESSIONS:
-            items = [
-                Row("session", g.mux, session=s)
-                for s in g.sessions
-                if q in s.name.lower()
-            ]
+            items, count = session_rows(g, q, expanded)
         else:
             items = [
                 Row("agent", g.mux, agent=a)
                 for a in g.agents
                 if not q or any(q in f.lower() for f in (a.name, a.session, a.tab))
             ]
+            count = len(items)
         if items or (which == SESSIONS and not q):
             note = "loading…" if g.loading else g.error or ""
-            rows.append(Row("group", g.mux, count=len(items), note=note))
+            rows.append(Row("group", g.mux, count=count, note=note))
             rows += items
     return rows
 
@@ -1895,6 +2084,8 @@ class Options:
     # Show only the lists, and inside a multiplexer stay open after a
     # switch.
     sidebar: bool = False
+    # Start with each session's tabs shown.
+    expand_tabs: bool = False
 
 
 class App:
@@ -1927,6 +2118,11 @@ class App:
         # stays on the first row while the multiplexers answer.
         self.touched = [False, False]
         self.filter = ""
+        # Whether a session shows its tabs: its entry in expanded, keyed by
+        # (mux, session key), which h and l set, or else tabs_default, which
+        # --tabs, H and L set.
+        self.tabs_default = options.expand_tabs
+        self.expanded: dict[tuple[str, str], bool] = {}
         self.mode: str | None = None  # filter, new, rename, kill or help
         self.input = ""
         self.target: Row | None = None
@@ -1979,7 +2175,10 @@ class App:
         return [self.groups[m] for m in self.ctx.listed]
 
     def rows(self, which: int) -> list[Row]:
-        return build_rows(self.ordered_groups(), which, self.filter)
+        return build_rows(self.ordered_groups(), which, self.filter, self.is_expanded)
+
+    def is_expanded(self, s: Session) -> bool:
+        return self.expanded.get((s.mux, s.key), self.tabs_default)
 
     def items(self, which: int) -> list[Row]:
         return items_of(self.rows(which))
@@ -1999,6 +2198,25 @@ class App:
 
     def agents_of(self, s: Session) -> list[Agent]:
         return [a for a in self.groups[s.mux].agents if a.session_key == s.key]
+
+    def agents_in_tab(self, tab: Tab) -> list[Agent]:
+        return [
+            a
+            for a in self.groups[tab.mux].agents
+            if a.session_key == tab.session_key and a.tab_id == tab.id
+        ]
+
+    def tabs_of(self, s: Session) -> list[Tab]:
+        if s.exited:
+            return []
+        return [t for t in self.groups[s.mux].tabs if t.session_key == s.key]
+
+    def session_of(self, row: Row) -> Session | None:
+        """A session row's session, or the session of a tab row."""
+        if row.session or not row.tab:
+            return row.session
+        key = row.tab.session_key
+        return next((s for s in self.groups[row.mux].sessions if s.key == key), None)
 
     def clamp(self) -> None:
         for w in (SESSIONS, AGENTS):
@@ -2151,6 +2369,13 @@ class App:
             ) if zellij else None
         if row.session and not row.session.exited and row.session.pane:
             return row.session.pane, row.session
+        if row.tab and row.tab.pane:
+            t = row.tab
+            if row.mux == "tmux":
+                return t.pane, None
+            return t.pane, Session(
+                row.mux, t.session, id=t.session_key if row.mux == "herdr" else ""
+            )
         return None
 
     def maybe_capture(self, row: Row, key: tuple[str, ...]) -> None:
@@ -2220,20 +2445,28 @@ class App:
                 return
             done = f"Switched to {row.session.name}."
             self.execute(backend.switch_session(row.session, inside), done)
+        elif row.tab:
+            tab, current = row.tab, self.current_session(mux)
+            if tab.active and inside and current and current.key == tab.session_key:
+                self.back()
+                return
+            plan = backend.switch_tab(tab, inside, current.name if current else None)
+            self.drop_busy_helper(plan, backend, tab.session)
+            self.execute(plan, f"Switched to {tab.name} in {tab.session}.")
         elif row.agent:
             current = self.current_session(mux)
             plan = backend.switch_agent(
                 row.agent, inside, current.name if current else None
             )
-            # The helper moves the session's first client, which is the
-            # attaching one only when the session has no other client.
-            if (
-                plan.helper
-                and isinstance(backend, Zellij)
-                and backend.has_clients(row.agent.session)
-            ):
-                plan.helper = None
+            self.drop_busy_helper(plan, backend, row.agent.session)
             self.execute(plan, f"Switched to {row.agent.name} in {row.agent.session}.")
+
+    def drop_busy_helper(self, plan: Plan, backend: Any, session: str) -> None:
+        """Drops the zellij helper of a plan when the session has a client.
+        The helper moves the session's first client, which is the attaching
+        one only when the session has no other client."""
+        if plan.helper and isinstance(backend, Zellij) and backend.has_clients(session):
+            plan.helper = None
 
     def new_session_dir(self, mux: str) -> tuple[str, str]:
         """The directory and automatic name of a new session in mux."""
@@ -2283,7 +2516,10 @@ class App:
             return
         if self.run_steps(self.backends[s.mux].rename(s, new)):
             if s.mux == "zellij":
+                # zellij keys sessions by name.
                 self.wanted[SESSIONS] = ("session", "zellij", new)
+                if ("zellij", s.name) in self.expanded:
+                    self.expanded["zellij", new] = self.expanded.pop(("zellij", s.name))
             s.name = new
             self.say(f"Renamed to {new}.")
             self.start_load(s.mux)
@@ -2293,6 +2529,7 @@ class App:
             group = self.groups[s.mux]
             group.sessions = [x for x in group.sessions if x.key != s.key]
             group.agents = [a for a in group.agents if a.session_key != s.key]
+            group.tabs = [t for t in group.tabs if t.session_key != s.key]
             self.clamp()
             self.say(f"{'Deleted' if s.exited else 'Killed'} {s.name}.")
             self.start_load(s.mux)
@@ -2365,6 +2602,8 @@ class App:
             row = self.selected()
             self.new_mux = row.mux if row else self.ctx.listed[0]
             self.mode, self.input = "new", ""
+        elif k in ("h", "left", "l", "right", "H", "L"):
+            self.show_tabs(k)
         elif k in ("r", "x"):
             self.session_dialog(k)
         elif k == "ctrl+l":
@@ -2378,9 +2617,42 @@ class App:
             else:
                 self.back()
 
+    def show_tabs(self, k: str) -> None:
+        """In the Sessions list, h and l hide and show the tabs of the
+        selected session, and H and L those of every session, also of the
+        sessions that appear later. The cursor stays on its row, except that
+        hiding moves it from a tab row to the tab's session."""
+        if self.focus != SESSIONS:
+            return
+        row = self.selected()
+        show = k in ("l", "right", "L")
+        if k in ("H", "L"):
+            self.tabs_default = show
+            self.expanded.clear()
+        else:
+            s = self.session_of(row) if row else None
+            if not s or not self.tabs_of(s):
+                return
+            self.expanded[s.mux, s.key] = show
+        if not row:
+            return
+        keep = item_key(row)
+        if row.tab and not show:
+            keep = ("session", row.mux, row.tab.session_key)
+        keys = [item_key(r) for r in self.items(SESSIONS)]
+        if keep in keys:
+            self.cursor[SESSIONS] = keys.index(keep)
+        self.touched[SESSIONS] = True
+        self.clamp()
+
     def session_dialog(self, k: str) -> None:
         row = self.selected()
-        if not row or not row.session:
+        if row and row.tab:
+            self.say(
+                "Rename and kill work on sessions. Press h to go to the session.",
+                warn=True,
+            )
+        elif not row or not row.session:
             self.say(
                 "Rename and kill work on sessions. Press Tab to go to the Sessions list.",
                 warn=True,
@@ -2601,6 +2873,8 @@ class View:
             accent = pen("▌", t.iris) if is_sel and focused else pen(" ")
             if r.session:
                 line = self.session_row(r.session, iw - 1, pen, is_sel)
+            elif r.tab:
+                line = self.tab_row(r.tab, iw - 1, pen, is_sel)
             elif r.agent:
                 line = self.agent_row(r.agent, iw - 1, pen, is_sel, name_w)
             else:
@@ -2649,17 +2923,28 @@ class View:
         if s.exited:
             right = pen(f"exited {s.age} ", t.muted, italic=True)
         else:
-            agents = self.app.agents_of(s)
-            blocked = any(a.status in ALERT_STATUSES for a in agents)
-            right = (
-                pen(f"◆{len(agents)} ", t.love if blocked else t.gold, bold=blocked)
-                if agents
-                else ""
-            )
+            right = self.agent_count(self.app.agents_of(s), pen)
             if w >= 32:
                 unit = "win" if s.mux == "tmux" else "tab"
                 right += pen(f"{plural(s.tabs, unit):<6} ", t.muted)
         return lr(left, right, w, pen)
+
+    def agent_count(self, agents: list[Agent], pen: Pen) -> str:
+        """The number of agents, highlighted when one of them waits for the
+        user, or nothing without agents."""
+        if not agents:
+            return ""
+        t = Canvas.theme
+        blocked = any(a.status in ALERT_STATUSES for a in agents)
+        return pen(f"◆{len(agents)} ", t.love if blocked else t.gold, bold=blocked)
+
+    def tab_row(self, tab: Tab, w: int, pen: Pen, is_sel: bool) -> str:
+        """A tab under its session, starting two cells right of where
+        session names start. The name is cut before the agent count goes."""
+        t = Canvas.theme
+        color = t.text if tab.active or is_sel else t.subtle
+        left = pen(" " * 5) + pen(tab.label, color, bold=tab.active)
+        return lr(left, self.agent_count(self.app.agents_in_tab(tab), pen), w, pen)
 
     def status(self, a: Agent, pen: Pen, wide: bool) -> str:
         t = Canvas.theme
@@ -2733,6 +3018,20 @@ class View:
             st = self.status(a, Pen(), True)
             if st:
                 info += paint(" · ", t.muted) + st
+        elif row and row.tab:
+            tab = row.tab
+            extra = (
+                paint(" " + tab.mux, t.mux(tab.mux), bold=True)
+                + sep
+                + paint(tab.session, t.text)
+                + sep
+                + paint(tab.label, t.subtle)
+                + " "
+            )
+            parts = [self.short_path(tab.path)] if tab.path else []
+            parts.append(plural(tab.panes, "pane"))
+            info = paint(" · ", t.muted).join(paint(p, t.subtle) for p in parts)
+            note = "focused pane"
         elif row and row.session:
             s = row.session
             extra = (
@@ -2919,7 +3218,9 @@ class View:
                 ("g G", "first / last (also Home End)"),
                 ("alt+j/k", "next / previous multiplexer"),
                 ("Tab", "sessions ⇄ agents"),
-                ("Enter", "switch to the session or agent"),
+                ("Enter", "switch to the session, tab or agent"),
+                ("h l ← →", "hide or show the session's tabs"),
+                ("H L", "hide or show every session's tabs"),
                 ("/", "filter as you type"),
                 ("n", "new session"),
                 ("r", "rename session"),
@@ -2977,6 +3278,12 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--sidebar",
         action="store_true",
         help="show only the lists; inside a multiplexer, stay open after a switch",
+    )
+    p.add_argument(
+        "--tabs",
+        choices=["collapsed", "expanded"],
+        default="collapsed",
+        help="start with each session's tabs hidden or shown",
     )
     # Internal: see zellij_focus_pane.
     p.add_argument("--zellij-focus-pane", nargs=3, help=argparse.SUPPRESS)
@@ -3037,7 +3344,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             dark = {"light": False, "dark": True}.get(args.theme)
             if dark is None:
                 dark = term.background_is_dark() is not False
-            options = Options(args.client, args.dir, dark, not args.no_bg, args.sidebar)
+            options = Options(
+                args.client,
+                args.dir,
+                dark,
+                not args.no_bg,
+                args.sidebar,
+                expand_tabs=args.tabs == "expanded",
+            )
             app = App(ctx, options, run_command, os.environ, inbox)
             run_app(app, term, inbox)
     except KeyboardInterrupt:
