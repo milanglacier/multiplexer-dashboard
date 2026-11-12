@@ -2917,7 +2917,9 @@ class View:
             name = pen(s.name, t.muted, italic=True)
         else:
             name = pen(s.name, t.text, bold=s.current or is_sel)
-        left = pen(" ") + mark + name
+        # The mark sits under the multiplexer name, so the session name
+        # starts two cells right of it.
+        left = mark + name
         if s.attached and not s.current and w >= 40:
             left += pen(" attached", t.muted)
         if s.exited:
@@ -2943,7 +2945,7 @@ class View:
         session names start. The name is cut before the agent count goes."""
         t = Canvas.theme
         color = t.text if tab.active or is_sel else t.subtle
-        left = pen(" " * 5) + pen(tab.label, color, bold=tab.active)
+        left = pen(" " * 4) + pen(tab.label, color, bold=tab.active)
         return lr(left, self.agent_count(self.app.agents_in_tab(tab), pen), w, pen)
 
     def status(self, a: Agent, pen: Pen, wide: bool) -> str:
