@@ -223,13 +223,26 @@ EOF
         zellij --layout "$tmp/zone.kdl" attach --create-background zone
         for s in ztwo zgone zdel zkill; do zellij attach --create-background $s; done
     )
+    # Whether zellij saved the layout of session $1. Each session has its
+    # own folder, which holds the session's name in session-metadata.kdl.
+    saved_layout() {
+        local m
+        for m in $(grep -lx "name \"$1\"" "$XDG_CACHE_HOME"/zellij/*/session_info/*/session-metadata.kdl 2>/dev/null); do
+            [[ -f "${m%/*}/session-layout.kdl" ]] && return 0
+        done
+        return 1
+    }
     for s in zgone zdel; do
         deadline=$((SECONDS + 10))
         until zellij --session $s action list-panes -j >/dev/null 2>&1 || ((SECONDS > deadline)); do
             sleep 0.1
         done
-        # Saved before it is killed, so that zellij can resurrect it.
-        zellij --session $s action save-session
+        # Saved before it is killed, so that zellij can resurrect it. A save
+        # right after the session starts writes no layout, so the save
+        # repeats until the layout is on disk.
+        until zellij --session $s action save-session && saved_layout $s || ((SECONDS > deadline)); do
+            sleep 0.1
+        done
         zellij kill-session $s
     done
     eventually "zellij lists the exited sessions" 2 \
@@ -340,6 +353,8 @@ if have zellij; then
     step "outside: Enter on a zellij agent attaches to its pane"
     open_outside zagent
     filter e2e:zagent codex
+    # Enter does nothing until the agent is listed.
+    wait_for e2e:zagent "◎ codex" >/dev/null
     t send-keys -t e2e:zagent Tab Enter
     codex_pane=$(zellij --session zone action list-panes -j |
         jq -r '.[] | select(.pane_command // "" | startswith("codex")) | "terminal_\(.id)"')
