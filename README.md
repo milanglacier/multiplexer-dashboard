@@ -187,7 +187,9 @@ multiplexer-dashboard [--multiplexer tmux|zellij|herdr] [--client CLIENT]
 
 Inside a multiplexer the dashboard lists only that multiplexer, or each one
 it runs in when they are nested. herdr workspaces appear as sessions, and
-herdr agents show herdr's own status: working, idle, blocked or done.
+herdr agents show herdr's own status: working, idle, blocked or done. With
+zellij 0.46 or later, an agent that reports its status to zellij shows it
+too, and can also show error.
 
 A new session with an empty name is named after the git repository or the
 directory it starts in. If a session with that name exists, the dashboard

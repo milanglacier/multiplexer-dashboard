@@ -187,7 +187,29 @@
     "tab_position": 0,
     "tab_name": "Tab #1",
     "pane_command": "claude /home/me/lib/agent-loop",
-    "pane_cwd": "/home/me/proj/plain"
+    "pane_cwd": "/home/me/proj/plain",
+    "program_status": [
+      {
+        "id": null,
+        "state": "Working",
+        "kind": null,
+        "progress": null,
+        "app": "claude",
+        "title": null,
+        "msg": null,
+        "updated_ms": 1794437365858
+      },
+      {
+        "id": "sub/a",
+        "state": "Blocked",
+        "kind": "Permission",
+        "progress": null,
+        "app": null,
+        "title": null,
+        "msg": null,
+        "updated_ms": 1794437365858
+      }
+    ]
   },
   {
     "id": 3,

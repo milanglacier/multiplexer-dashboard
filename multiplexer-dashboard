@@ -28,7 +28,9 @@ opencode, pi, gemini, aider, amp, crush, goose, cursor-agent, qwen, droid and
 copilot, or of the comma-separated names in MULTIPLEXER_DASHBOARD_AGENTS.
 When the foreground program is an interpreter (node, bun, deno or python),
 the name comes from the first argument that is not an option, such as
-".../bin/gemini". Herdr reports its own agents and their status. Each
+".../bin/gemini". Herdr reports its own agents and their status. Zellij
+0.46 and later report the status that an agent sends with the OSC 7501
+escape sequence. Each
 detected agent has its own icon, and every other agent has the icon "◇".
 
 New sessions are named as multiplexer-new-session names them: "~" for the
@@ -819,14 +821,19 @@ INTERPRETER_RE = re.compile(r"node|nodejs|bun|deno|python[0-9.]*")
 SCRIPT_EXT_RE = re.compile(r"\.(?:c?js|mjs|ts|py)$")
 
 
-# The icon of each agent status, the same as herdr's "symbols" style.
+# The icon of each agent status, the same as herdr's "symbols" style. Only
+# zellij reports "error", which shares the icon of "blocked".
 STATUS_ICONS = {
     "working": "◐",
     "blocked": "×",
+    "error": "×",
     "done": "✓",
     "idle": "○",
     "unknown": "·",
 }
+# The statuses of an agent that waits for the user. The lists highlight
+# them.
+ALERT_STATUSES = ("blocked", "error")
 
 
 def agent_icon(name: str) -> str:
@@ -1257,11 +1264,23 @@ def parse_zellij_panes(
                     f"terminal_{p['id']}",
                     name,
                     p.get("pane_cwd") or "",
+                    zellij_status(p),
                     tab_id=str(p.get("tab_id", "")),
                 )
             )
     agents.sort(key=lambda a: (a.tab_index, to_int(a.pane.split("_")[-1])))
     return agents
+
+
+def zellij_status(pane: dict[str, Any]) -> str | None:
+    """The status that the program in a zellij pane reports with OSC 7501,
+    such as "working". Zellij lists it in `program_status`, where the record
+    without an id is the program's own status and the others are its
+    subtasks. Zellij before 0.46 lists no status."""
+    for record in pane.get("program_status") or []:
+        if record.get("id") is None and record.get("state"):
+            return str(record["state"]).lower()
+    return None
 
 
 def zellij_pane_tabs(panes_json: str) -> dict[str, str]:
@@ -2631,7 +2650,7 @@ class View:
             right = pen(f"exited {s.age} ", t.muted, italic=True)
         else:
             agents = self.app.agents_of(s)
-            blocked = any(a.status == "blocked" for a in agents)
+            blocked = any(a.status in ALERT_STATUSES for a in agents)
             right = (
                 pen(f"◆{len(agents)} ", t.love if blocked else t.gold, bold=blocked)
                 if agents
@@ -2648,10 +2667,10 @@ class View:
         glyph = STATUS_ICONS.get(st or "")
         if glyph is None:
             return ""
-        bold = st == "blocked"
+        bold = st in ALERT_STATUSES
         if st == "working":
             color = t.gold
-        elif st == "blocked":
+        elif st in ALERT_STATUSES:
             color = t.love
         elif st == "idle":
             color = t.foam
@@ -2671,7 +2690,7 @@ class View:
     def agent_row(self, a: Agent, w: int, pen: Pen, is_sel: bool, name_w: int) -> str:
         t = Canvas.theme
         c = t.agent(a.name)
-        blocked = a.status == "blocked"
+        blocked = a.status in ALERT_STATUSES
         # A space always separates the name from the session.
         name = fit(pen(a.name, c, bold=is_sel or blocked), name_w, pen)
         left = (

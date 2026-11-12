@@ -63,9 +63,11 @@ exec env -u TMUX -u TMUX_PANE "$@"
 EOF
 # Fake agents print a line and wait. tmux and zellij name a pane's program
 # after argv[0], so `exec -a` gives each its name. gemini runs as an
-# argument of node, as the real one does.
+# argument of node, as the real one does. With FAKE_STATUS set, an agent
+# reports that status with OSC 7501, as real agents do in zellij.
 cat >"$tmp/lib/agent-loop" <<'EOF'
 printf '\033[1;35mfake %s\033[0m in %s\n' "$FAKE_NAME" "$PWD"
+[ -n "${FAKE_STATUS:-}" ] && printf '\033]7501;state=%s\033\\' "$FAKE_STATUS"
 trap exit TERM HUP
 while :; do sleep 1000 & wait; done
 EOF
@@ -218,8 +220,10 @@ layout {
     }
 }
 EOF
+    # The agents in zellij report the status "error".
     (
         cd "$tmp/proj/repo" || exit
+        export FAKE_STATUS=error
         zellij --layout "$tmp/zone.kdl" attach --create-background zone
         for s in ztwo zgone zdel zkill; do zellij attach --create-background $s; done
     )
@@ -293,6 +297,7 @@ done
 check "groups in order" "$(tr ' ' '\n' <<<"$rows" | grep . | sort -n | tr '\n' ' ')" "$rows"
 if have zellij; then
     wait_for $w "exited" && echo "ok: an exited zellij session is listed"
+    wait_for $w "× error" && echo "ok: the agent status that zellij reports"
 fi
 if have herdr; then
     wait_for $w "× blocked" && echo "ok: herdr's agent status"

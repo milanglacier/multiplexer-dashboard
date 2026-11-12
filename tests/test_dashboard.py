@@ -106,7 +106,9 @@ class AgentDetectionTest(unittest.TestCase):
         self.assertEqual(md.agent_icon("myagent"), md.CUSTOM_AGENT_ICON)
 
     def test_status_icons_differ_from_agent_icons(self):
-        statuses = list(md.STATUS_ICONS.values())
+        # "error" shares the icon of "blocked"; every other icon is unique.
+        self.assertEqual(md.STATUS_ICONS["error"], md.STATUS_ICONS["blocked"])
+        statuses = [i for s, i in md.STATUS_ICONS.items() if s != "error"]
         self.assertEqual(len(set(statuses)), len(statuses))
         self.assertEqual({md.width(i) for i in statuses}, {1})
         agents = set(md.AGENT_ICONS.values()) | {md.CUSTOM_AGENT_ICON}
@@ -271,6 +273,9 @@ class ZellijTest(unittest.TestCase):
                 ("gemini", "terminal_3", "Tab #1", "0"),
             ],
         )
+        # claude reports its status, and the status of its subtask does not
+        # count. gemini reports none, as with zellij before 0.46.
+        self.assertEqual([a.status for a in agents], ["working", None])
         # list-tabs counts a tab that has no panes yet.
         self.assertEqual(s.tabs, 2)
         # No tab is active without a client, so the first tab's focused
@@ -1076,6 +1081,9 @@ class ScreenTest(unittest.TestCase):
         )
         text = "\n".join(plain(line) for line in app.render(120, 30))
         self.assertIn("× blocked", text)
+        app.groups["herdr"].agents[0].status = "error"
+        text = "\n".join(plain(line) for line in app.render(120, 30))
+        self.assertIn("× error", text)
         app.set_group(md.Group("herdr", error="server not running"))
         text = "\n".join(plain(line) for line in app.render(120, 30))
         self.assertIn("server not running", text)
