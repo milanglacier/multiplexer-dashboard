@@ -302,9 +302,9 @@ step "outside: Alt keys jump between multiplexers"
 if have zellij; then
     first=$(selected $w)
     t send-keys -t $w M-j
-    wait_for $w "▌   alpha" && echo "ok: alt+j"
+    wait_for $w "▌  alpha" && echo "ok: alt+j"
     t send-keys -t $w M-k
-    wait_for $w "▌   $first" && echo "ok: alt+k"
+    wait_for $w "▌  $first" && echo "ok: alt+k"
 fi
 
 step "outside: filter, preview"
@@ -335,7 +335,7 @@ step "outside: a click selects, a second click attaches"
 t send-keys -t $w Tab
 row=$(row_of $w "beta ")
 click $w 6 "$row"
-wait_for $w "▌   beta" && echo "ok: a click selects"
+wait_for $w "▌  beta" && echo "ok: a click selects"
 click $w 6 "$row"
 eventually "the attached tmux client is in beta" beta tm list-clients -F '#{session_name}'
 t kill-window -t $w
@@ -441,7 +441,7 @@ filter e2e:tin alpha
 t send-keys -t e2e:tin l
 wait_for e2e:tin "1 agent" && echo "ok: l shows the windows"
 t send-keys -t e2e:tin j j
-wait_for e2e:tin "▌     1 agent" >/dev/null
+wait_for e2e:tin "▌    1 agent" >/dev/null
 t send-keys -t e2e:tin Enter
 eventually "the client is on the agent window" agent tm display -p -c "$client" '#{window_name}'
 
@@ -638,7 +638,7 @@ EOF
     row=$(row_of $w " zside2 ")
     click $w 6 "$row"
     eventually "the sidebar has focus" "$side_one" zclients zside
-    wait_for $w "▌   zside2" && echo "ok: the click selected the row"
+    wait_for $w "▌  zside2" && echo "ok: the click selected the row"
 
     step "zellij sidebar: Enter on another session moves the client and the pane stays"
     t send-keys -t $w Enter
